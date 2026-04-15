@@ -1,7 +1,22 @@
 from fastapi import APIRouter, HTTPException
 from app.memory.hybrid import memory
+from app.memory.consolidation import consolidate_memories
 
 router = APIRouter()
+
+
+@router.post("/consolidate")
+async def trigger_consolidation():
+    """Trigger offline memory consolidation (dreaming).
+
+    Deduplicates vectors, resolves graph contradictions, prunes low-value
+    nodes, and compresses verbose episodic memories.
+    """
+    try:
+        report = await consolidate_memories(memory)
+        return report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Consolidation failed: {e}")
 
 
 @router.get("/stats")

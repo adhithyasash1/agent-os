@@ -120,7 +120,7 @@ export default function ChatPage() {
                       Score:{" "}
                       <span
                         className={`font-mono font-bold ${
-                          m.score && m.score > 0.8 ? "text-emerald-400" : "text-amber-400"
+                          m.score && m.score >= 0.7 ? "text-emerald-400" : "text-amber-400"
                         }`}
                       >
                         {m.score?.toFixed(2)}

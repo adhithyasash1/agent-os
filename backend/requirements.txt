@@ -24,3 +24,5 @@ httpx
 jinja2
 python-multipart
 tavily-python
+flashrank
+crawl4ai

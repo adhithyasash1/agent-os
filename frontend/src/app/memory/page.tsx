@@ -17,12 +17,24 @@ interface SearchResults {
   graph: Array<{
     type: string;
     entity?: string;
+    compiled_truth?: string;
     related_task?: string;
     score?: number;
     tools_used?: string[];
     related_entities?: string[];
     intent?: string;
   }>;
+}
+
+interface ConsolidationReport {
+  started_at: string;
+  completed_at?: string;
+  duplicates_merged: number;
+  contradictions_resolved: number;
+  low_value_pruned: number;
+  episodes_compressed: number;
+  truths_compiled?: number;
+  errors: string[];
 }
 
 export default function MemoryPage() {
@@ -36,12 +48,19 @@ export default function MemoryPage() {
   const [results, setResults] = useState<SearchResults | null>(null);
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
+  const [consolidating, setConsolidating] = useState(false);
+  const [consolidationReport, setConsolidationReport] =
+    useState<ConsolidationReport | null>(null);
 
-  useEffect(() => {
+  const fetchStats = () => {
     fetch(`${API}/memory/stats`)
       .then((r) => r.json())
       .then(setStats)
       .catch(() => {});
+  };
+
+  useEffect(() => {
+    fetchStats();
   }, []);
 
   const search = async () => {
@@ -126,6 +145,109 @@ export default function MemoryPage() {
             </div>
           </div>
         ))}
+      </div>
+
+      {/* Consolidation */}
+      <div className="bg-slate-900/50 border border-slate-800/60 rounded-2xl p-5 space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-300">
+              Memory Consolidation
+            </h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Deduplicate vectors, resolve contradictions, prune low-value
+              nodes, compress memories, compile entity truths.
+            </p>
+          </div>
+          <button
+            onClick={async () => {
+              setConsolidating(true);
+              setConsolidationReport(null);
+              try {
+                const res = await fetch(`${API}/memory/consolidate`, {
+                  method: "POST",
+                });
+                const report = await res.json();
+                setConsolidationReport(report);
+                fetchStats();
+              } catch {
+                setConsolidationReport({
+                  started_at: new Date().toISOString(),
+                  duplicates_merged: 0,
+                  contradictions_resolved: 0,
+                  low_value_pruned: 0,
+                  episodes_compressed: 0,
+                  errors: ["Failed to connect to backend"],
+                });
+              } finally {
+                setConsolidating(false);
+              }
+            }}
+            disabled={consolidating}
+            className="px-4 py-2 bg-purple-600/20 hover:bg-purple-600/30 border border-purple-500/30 text-purple-400 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+          >
+            {consolidating ? (
+              <span className="flex items-center gap-2">
+                <span className="w-3 h-3 border-2 border-purple-400/30 border-t-purple-400 rounded-full animate-spin" />
+                Consolidating...
+              </span>
+            ) : (
+              "Run Consolidation"
+            )}
+          </button>
+        </div>
+
+        {consolidationReport && (
+          <div className="bg-slate-950/60 border border-slate-800/40 rounded-xl p-4 space-y-2">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+              {[
+                {
+                  label: "Duplicates Merged",
+                  value: consolidationReport.duplicates_merged,
+                  color: "text-blue-400",
+                },
+                {
+                  label: "Contradictions Resolved",
+                  value: consolidationReport.contradictions_resolved,
+                  color: "text-amber-400",
+                },
+                {
+                  label: "Low-Value Pruned",
+                  value: consolidationReport.low_value_pruned,
+                  color: "text-rose-400",
+                },
+                {
+                  label: "Episodes Compressed",
+                  value: consolidationReport.episodes_compressed,
+                  color: "text-emerald-400",
+                },
+                {
+                  label: "Truths Compiled",
+                  value: consolidationReport.truths_compiled ?? 0,
+                  color: "text-cyan-400",
+                },
+              ].map(({ label, value, color }) => (
+                <div key={label} className="text-center">
+                  <p className={`text-xl font-mono font-bold ${color}`}>
+                    {value}
+                  </p>
+                  <p className="text-[10px] text-slate-500 mt-0.5">{label}</p>
+                </div>
+              ))}
+            </div>
+            {consolidationReport.errors.length > 0 && (
+              <div className="text-xs text-rose-400 bg-rose-500/10 rounded-lg p-2 mt-2">
+                {consolidationReport.errors.join(", ")}
+              </div>
+            )}
+            {consolidationReport.completed_at && (
+              <p className="text-[10px] text-slate-600 text-right">
+                Completed{" "}
+                {new Date(consolidationReport.completed_at).toLocaleString()}
+              </p>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Search */}
@@ -221,6 +343,11 @@ export default function MemoryPage() {
                         {r.entity && (
                           <p className="text-sm font-medium text-emerald-300">
                             {r.entity}
+                          </p>
+                        )}
+                        {r.compiled_truth && (
+                          <p className="text-xs text-emerald-400/80 italic border-l-2 border-emerald-500/30 pl-2">
+                            {r.compiled_truth}
                           </p>
                         )}
                         {r.related_task && (

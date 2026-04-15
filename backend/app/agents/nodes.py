@@ -5,6 +5,7 @@ Tier A improvements applied:
   1. SimpleMem pattern   → 3-tier memory retrieval + context budget management
   2. LLM Council pattern → critique-then-score evaluator
   3. EdgeQuake pattern   → GraphRAG-lite retrieval via Neo4j in planner
+  4. FlashRank reranker  → cross-encoder reranking after vector retrieval
 """
 
 import re
@@ -113,13 +114,24 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
 
 
 async def _retrieve_vector(query: str) -> str:
-    """Tier 1: Chroma vector similarity search."""
+    """Tier 1: Chroma vector similarity search + FlashRank reranking.
+
+    Fetches 3x candidates, reranks with cross-encoder, keeps top-k.
+    """
     try:
-        docs = await memory.vector_store.asimilarity_search(
-            query, k=settings.VECTOR_SEARCH_K
-        )
-        if docs:
-            return "\n".join(doc.page_content for doc in docs)
+        from app.tools.reranker import rerank
+
+        # Fetch more candidates than needed for reranking
+        fetch_k = settings.VECTOR_SEARCH_K * settings.RERANK_FETCH_MULTIPLIER
+        docs = await memory.vector_store.asimilarity_search(query, k=fetch_k)
+        if not docs:
+            return ""
+
+        texts = [doc.page_content for doc in docs]
+
+        # Rerank with cross-encoder (falls back to original order if unavailable)
+        reranked = rerank(query, texts, top_k=settings.VECTOR_SEARCH_K)
+        return "\n".join(reranked)
     except Exception as e:
         logger.warning(f"Vector search skipped: {e}")
     return ""
@@ -139,21 +151,35 @@ async def _retrieve_episodic(query: str) -> str:
 
 
 async def _retrieve_graph(query: str) -> str:
-    """Tier 3: Neo4j graph traversal — entity relationships (EdgeQuake pattern)."""
+    """Tier 3: Neo4j graph traversal — entity relationships (EdgeQuake pattern).
+
+    Prefers compiled truth summaries when available, falls back to raw
+    task intents for entities that haven't been compiled yet.
+    """
     try:
         graph_results = await memory.search_graph(query, limit=settings.GRAPH_SEARCH_K)
         if graph_results:
             lines = []
+            seen_entities = set()
             for r in graph_results:
                 if r.get("type") == "graph":
-                    parts = [f"Entity: {r.get('entity', '?')}"]
-                    if r.get("related_task"):
-                        parts.append(f"used in: \"{r['related_task'][:100]}\"")
-                    if r.get("tools_used"):
-                        parts.append(f"tools: {', '.join(r['tools_used'])}")
-                    if r.get("related_entities"):
-                        parts.append(f"related to: {', '.join(r['related_entities'][:5])}")
-                    lines.append(" | ".join(parts))
+                    entity = r.get("entity", "?")
+                    compiled = r.get("compiled_truth", "")
+
+                    # Prefer compiled truth — one clean sentence per entity
+                    if compiled and entity not in seen_entities:
+                        lines.append(f"[{entity}] {compiled}")
+                        seen_entities.add(entity)
+                    else:
+                        # Fallback to raw traversal data
+                        parts = [f"Entity: {entity}"]
+                        if r.get("related_task"):
+                            parts.append(f"used in: \"{r['related_task'][:100]}\"")
+                        if r.get("tools_used"):
+                            parts.append(f"tools: {', '.join(r['tools_used'])}")
+                        if r.get("related_entities"):
+                            parts.append(f"related to: {', '.join(r['related_entities'][:5])}")
+                        lines.append(" | ".join(parts))
                 elif r.get("type") == "task":
                     lines.append(
                         f"Past task (score {r.get('score', 0):.1f}): {r.get('intent', '')[:100]}"

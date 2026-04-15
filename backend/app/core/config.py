@@ -47,5 +47,13 @@ class Settings(BaseSettings):
     LLM_MAX_RETRIES: int = 2
     LLM_RETRY_DELAY: float = 2.0            # seconds between retries
 
+    # --- Reranking ---
+    RERANK_FETCH_MULTIPLIER: int = 3        # fetch k*multiplier candidates, rerank to k
+    RERANK_MODEL: str = "ms-marco-MiniLM-L-12-v2"  # FlashRank model (~33MB)
+
+    # --- Memory consolidation ---
+    CONSOLIDATION_PRUNE_THRESHOLD: float = 0.3  # tasks below this score get pruned
+    CONSOLIDATION_COMPRESS_MIN_CHARS: int = 500  # only compress episodes longer than this
+
 
 settings = Settings()
