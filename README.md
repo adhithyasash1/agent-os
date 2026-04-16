@@ -7,8 +7,7 @@ plans a next step, calls tools, verifies the result, and logs every step as
 both a trace and an RL transition, all on one machine, in one process, using
 SQLite as the default store.
 
-It is not a general AGI. It is a small, honest runtime you can read in an
-afternoon, run without any API keys, and benchmark against ablations of
+run without any API keys, and benchmark against ablations of
 itself.
 
 ---
