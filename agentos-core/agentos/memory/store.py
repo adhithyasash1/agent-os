@@ -67,6 +67,7 @@ class MemoryStore:
             self._ensure_column(c, "memory_entries", "verifier_score", "REAL")
 
             self._migrate_legacy_memory_table(c)
+            self._drop_legacy_fts(c)
 
             try:
                 c.execute(
@@ -123,6 +124,25 @@ class MemoryStore:
             (table,),
         ).fetchone()
         return row is not None
+
+    def _drop_legacy_fts(self, conn: sqlite3.Connection) -> None:
+        """Drop an FTS index that predates the tiered-memory schema.
+
+        Older DBs created `memory_fts` as an FTS5 mirror of the `memory` table
+        with only the `text` column. The current triggers write `(text, kind)`
+        into `memory_fts`, which fails against the legacy definition. If we
+        detect the old shape, drop the FTS tables and stale triggers so the
+        next CREATE VIRTUAL TABLE (idempotent) rebuilds them correctly.
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_fts'"
+        ).fetchone()
+        if row and "kind" in (row["sql"] or ""):
+            return
+        for trigger in ("memory_ai", "memory_ad", "memory_entries_ai",
+                        "memory_entries_au", "memory_entries_ad"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        conn.execute("DROP TABLE IF EXISTS memory_fts")
 
     def _migrate_legacy_memory_table(self, conn: sqlite3.Connection) -> None:
         if not self._table_exists(conn, "memory"):
