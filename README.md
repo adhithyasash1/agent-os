@@ -4,25 +4,29 @@ A **local-first orchestration and observability layer** for agentic workflows.
 
 agentos-core accepts a user request, retrieves tiered memory, packs context,
 plans a next step, calls tools, verifies the result, and logs every step as
-both a trace and an RL transition, all on one machine, in one process, using
+both a `trace_event` and a **structured run log with reward annotation**
+(stored in the `rl_transitions` table — see [Logging & observability](#logging--observability)
+for what this is and isn't). All on one machine, in one process, using
 SQLite as the default store.
 
-run without any API keys, and benchmark against ablations of
-itself.
+It is not a general AGI. It is a small, honest runtime you can read in an
+afternoon, run as an offline demo without any API keys, and upgrade to a
+real LLM the moment you want real signal.
 
 ---
 
 ## What problem it solves
 
-Most agent frameworks assume cloud infra (vector DBs, graph DBs, hosted LLMs,
-observability SaaS). That makes them hard to reason about, hard to debug
-locally, and hard to prove anything about.
+Most agent frameworks assume cloud infra (vector DBs, graph DBs, hosted
+LLMs, observability SaaS). That makes them hard to reason about, hard to
+debug locally, and hard to prove anything about.
 
 agentos-core flips that:
 
 - **local by default**: SQLite only; no Neo4j / Chroma / Qdrant needed
 - **observable by default**: every phase of every run is a row in
-  `trace_events`, and every decision can also be captured in `rl_transitions`
+  `trace_events`; every decision also emits a reward-annotated row in
+  `rl_transitions`
 - **testable by default**: a deterministic mock LLM runs the whole loop
   without a network
 - **measurable by default**: one `python -m bench.runner --all-ablations`
@@ -44,11 +48,24 @@ understand  →  retrieve  →  plan  →  act  →  verify  →  (reflect & ret
 | `retrieve`   | Search `working`, `episodic`, and `semantic` memory, then rank and pack context | `enable_memory` |
 | `plan`       | LLM emits ReAct JSON `{goal, action, tool, tool_args, observation_summary, confidence, stop_reason, answer}` | `enable_planner` |
 | `act`        | Execute the chosen tool via the registry                  | `enable_tools`     |
-| `verify`     | Heuristic or expected-match scoring plus verifier metadata | always            |
+| `verify`     | `expected_contains` match (benchmarks) → LLM-as-judge (live, opt-in) → heuristic fallback (weak) | always |
 | `reflect`    | LLM critique → feed back into planner for next iteration  | `enable_reflection`|
-| `final`      | Persist answer + score, write RL tuples, and promote only verified facts into durable memory | always |
+| `final`      | Persist answer + score. Promote facts to durable memory **only** when the verification is trustworthy | always |
 
 Max iterations and the pass threshold are configurable.
+
+### What "trustworthy" means for memory promotion
+
+The loop only writes to durable (`episodic` / `semantic`) memory when the
+verification step returns `trustworthy=true`. Today that means one of:
+
+- an `expected_contains` match (benchmark-time, not live); or
+- an LLM-as-judge score where both `correct ≥ 0.7` and `grounded ≥ 0.5`.
+
+The heuristic scorer (grounding overlap + refusal detection) is a **weak
+signal** and is never a standalone promotion gate. This is a deliberate
+change from earlier versions, which would happily promote fabricated
+answers that simply echoed context keywords.
 
 ---
 
@@ -57,7 +74,7 @@ Max iterations and the pass threshold are configurable.
 ```
 agentos/
 ├── config.py             # pydantic-settings; profiles + feature flags
-├── main.py               # FastAPI entrypoint + static UI mount
+├── main.py               # FastAPI entrypoint + lifespan + static UI mount
 ├── runtime/
 │   ├── loop.py           # The phase-by-phase agent loop
 │   ├── context_packer.py # Utility-ranked context budgeting
@@ -70,10 +87,10 @@ agentos/
 ├── llm/
 │   ├── protocol.py       # LLM.complete(prompt, system=...)
 │   ├── mock.py           # Deterministic mock for tests/minimal profile
-│   ├── ollama.py         # Optional Ollama chat backend
+│   ├── ollama.py         # Ollama chat backend (local + cloud models)
 │   └── factory.py
 ├── eval/
-│   ├── scorer.py         # expected-match + grounded-heuristic scoring
+│   ├── scorer.py         # expected / llm-judge / heuristic
 │   └── reflection.py     # critique prompt
 └── api/routes.py         # /runs, /traces, /memory, /tools, /config, /health
 bench/                    # tasks + runner + report
@@ -82,33 +99,18 @@ tests/                    # pytest suite (uses MockLLM, no network)
 ui/index.html             # minimal single-file trace viewer
 ```
 
-### Core vs. optional
-
-| Component          | Core | Optional | Flag                     |
-|--------------------|:----:|:--------:|--------------------------|
-| FastAPI API        | ✅   |          |                          |
-| SQLite TraceStore  | ✅   |          |                          |
-| SQLite MemoryStore | ✅   |          | `enable_memory`          |
-| Context packer     | ✅   |          | `context_char_budget`    |
-| Calculator tool    | ✅   |          | `enable_tools`           |
-| MockLLM            | ✅   |          | `llm_backend=mock`       |
-| Planner (LLM JSON) | ✅   |          | `enable_planner`         |
-| Scorer             | ✅   |          |                          |
-| RL transition log  | ✅   |          |                          |
-| Reflection         |      | ✅       | `enable_reflection`      |
-| HTTP fetch tool    |      | ✅       | `enable_http_fetch`      |
-| Ollama backend     |      | ✅       | `llm_backend=ollama`     |
-| Tavily search      |      | ✅       | `enable_tavily`          |
-| OpenTelemetry bridge |    | ✅       | `enable_otel`            |
-| Next.js console    |      | ✅       | `console/`               |
-| Static UI          |      | ✅       | (served if `ui/` exists) |
+Components are instantiated once at FastAPI lifespan startup and attached
+to `app.state`. Every route receives them via `Depends(get_components)`,
+so there is no mutable module-level singleton and no race under async
+load. The `/config` patch endpoint builds a fresh bundle from the new
+settings and swaps `app.state.components` atomically under an asyncio
+lock.
 
 ---
 
-## Quickstart (zero external services)
+## Quickstart (offline demo, zero external services)
 
 ```bash
-cd agentos-core
 python3 -m venv venv && source venv/bin/activate
 pip install -e '.[dev]'
 
@@ -121,20 +123,6 @@ uvicorn agentos.main:app --reload
 Open <http://localhost:8000/> for the trace viewer, or
 <http://localhost:8000/docs> for the OpenAPI docs.
 
-### Optional Next.js console
-
-An operator-facing console also lives in `console/`. It uses Next.js App
-Router, TanStack Query, shadcn-style components, and Motion.
-
-```bash
-cd console
-npm install
-npm run dev
-```
-
-Point it at the API by copying `.env.local.example` to `.env.local` and
-setting `NEXT_PUBLIC_AGENTOS_API_BASE`.
-
 Try it:
 
 ```bash
@@ -143,23 +131,51 @@ curl -s http://localhost:8000/api/v1/runs \
   -d '{"input": "Calculate 12 * 11"}' | jq
 ```
 
-No API keys are required. The default `minimal` profile uses MockLLM, which
-is deterministic and gives the loop just enough signal to exercise tools,
-memory, and scoring.
+The default `minimal` profile uses MockLLM. **MockLLM is a stub, not a
+model** — it's good enough to exercise the loop, memory, tools, and trace
+writer, but the answers are hard-coded lookups. Treat MockLLM benchmark
+numbers as smoke-test signal only.
+
+### Optional Next.js console
+
+```bash
+cd console && npm install && npm run dev
+```
+
+Point it at the API by setting `NEXT_PUBLIC_AGENTOS_API_BASE=http://localhost:8000/api/v1`.
 
 ---
 
-## Running with Ollama
+## Running with Ollama (real LLM, local + cloud models)
+
+agentos-core talks to Ollama via the standard local daemon at
+`http://localhost:11434`. Both on-device and cloud-served models work
+through the same endpoint — cloud models just require a one-time
+`ollama signin` first.
 
 ```bash
-# in .env (or export env vars)
+# once, to authenticate for cloud models
+ollama signin
+ollama pull gemma4:31b-cloud     # 31B cloud-served Gemma 4
+ollama serve                     # leave running
+
+# .env (or export)
 AGENTOS_PROFILE=full
-AGENTOS_LLM_BACKEND=ollama
-AGENTOS_OLLAMA_MODEL=llama3.2
+AGENTOS_OLLAMA_MODEL=gemma4:31b-cloud
+# leave AGENTOS_OLLAMA_API_KEY empty — cloud-model auth goes through
+# the local daemon, not the HTTP request.
 ```
 
-Ensure Ollama is running locally (`ollama serve` and `ollama pull llama3.2`),
-then start the API as above.
+`profile=full` auto-switches the backend to `ollama`, turns on the
+**LLM-as-judge** verification path, and keeps tools available.
+
+If instead you want to run a local model, pick any tag Ollama supports
+(e.g. `gemma3:27b`, `qwen3:14b`, `llama3.2`) and drop the `-cloud`
+suffix. On-device models do not need `ollama signin`.
+
+When you're talking to an Ollama endpoint behind a reverse proxy that
+enforces bearer auth, set `AGENTOS_OLLAMA_API_KEY` — the HTTP client
+will send `Authorization: Bearer <key>` on every `/api/chat` call.
 
 ---
 
@@ -171,17 +187,17 @@ pytest -q
 
 The suite covers:
 
-- **memory**: tiered storage, salience filters, and verified promotion
+- **memory**: tiered storage, salience filters, verified promotion, TTL edge cases
 - **tools**: calculator, flag gating, unknown tool handling, unsafe input
-- **scorer**: expected-match, grounding bonus, and refusal handling
-- **trace**: run lifecycle, event listing, and RL transition persistence
+- **scorer**: expected-match, grounding heuristic, LLM-judge happy path, judge error fallbacks, trustworthy gate
+- **trace**: run lifecycle, event listing, rl_transitions persistence
 - **loop**: happy path, tool path, empty-input rejection, planner schema,
-  durable-memory gating, and trace completeness
-- **api**: health, runs create/list/get, memory search, config patch,
-  feedback writes, and empty input rejection
+  durable-memory promotion (positive + negative), trace completeness
+- **api**: health, runs create/list/get, memory search, config patch
+  roundtrip, feedback writes, empty input rejection
 
-All tests run against MockLLM and a temporary SQLite DB with no network and
-no model downloads.
+All tests run against MockLLM and a temporary SQLite DB with no network
+and no model downloads.
 
 ---
 
@@ -201,6 +217,28 @@ python -m bench.runner --all-ablations
 python -m bench.report
 ```
 
+### Read this before you trust the numbers
+
+The default bench runs against **MockLLM**, whose `_direct_answer`
+lookup table happens to contain the exact answer strings the benchmark
+tasks check for. That is:
+
+- Numbers produced by `profile=minimal` are not a measurement of
+  reasoning quality. They measure whether the loop, tools, memory, and
+  scoring plumbing all fire correctly end-to-end.
+- Ablation deltas against MockLLM are uninformative — the mock bypasses
+  the capability each ablation is supposed to stress. `no-memory ≈ full`
+  under MockLLM is not a finding, it's a consequence of the mock.
+
+For a real measurement, run benchmarks with the Ollama backend:
+
+```bash
+AGENTOS_PROFILE=full \
+AGENTOS_LLM_BACKEND=ollama \
+AGENTOS_OLLAMA_MODEL=gemma4:31b-cloud \
+python -m bench.runner --profile full --all-ablations
+```
+
 ### Tasks
 
 `bench/tasks.json` ships a small, balanced set:
@@ -212,17 +250,17 @@ python -m bench.report
 - `failure_handling`: empty input, nonsense, fabrication baiting
 
 Tasks are also tagged by slice so you can track retrieval-required,
-tool-required, multi-step, long-context, refusal-safety, and reflection-roi
-behavior independently.
+tool-required, multi-step, long-context, refusal-safety, and
+reflection-roi behavior independently.
 
 ### Metrics tracked per run
 
 - `overall_score`: mean of per-task scores
 - `success_rate`: fraction scoring ≥ 0.6
 - `tool_call_success_rate`: of tasks with `expected_tool`, how many called it
-- `tool_precision` / `tool_recall`: whether tool usage is both correct and complete
+- `tool_precision` / `tool_recall`: correctness + completeness of tool use
 - `context_utility_rate`: whether retrieved context actually improved solved retrieval tasks
-- `reflection_roi`: score delta when reflection fired
+- `reflection_roi`: score delta on tasks where reflection fired
 - `mean_latency_ms`: wall-clock per task
 - `by_category` and `by_slice`: score breakdowns
 - `flags`: feature flags used for this run
@@ -237,12 +275,13 @@ behavior independently.
 | `no-tools`       | tool execution   |
 | `no-reflection`  | critique retry   |
 
-`bench/report.py` emits a markdown report with a summary table and deltas
-vs. `full`, so you can see whether a component is pulling its weight.
+`bench/report.py` emits a markdown report with a summary table and
+deltas vs. `full`, so you can see whether a component is pulling its
+weight — **when you use a real LLM**. See the disclaimer above.
 
 ---
 
-## Observability
+## Logging & observability
 
 Every run produces a complete trace:
 
@@ -250,7 +289,10 @@ Every run produces a complete trace:
 GET /api/v1/runs/{run_id}
 ```
 
-Returns the run row plus ordered `trace_events`, each carrying:
+Returns the run row plus ordered `trace_events` and reward-annotated run
+log rows from `rl_transitions`.
+
+Each `trace_event` carries:
 
 - `kind` — `understand | retrieve | plan | tool_call | verify | reflect | final | error`
 - `name` — tool/node name or short label
@@ -258,78 +300,110 @@ Returns the run row plus ordered `trace_events`, each carrying:
 - `latency_ms`, `tokens_in`, `tokens_out` (best-effort)
 - `error` — populated if the step failed
 
-Each run also includes ordered `rl_transitions` with `(state, action,
-observation, reward)` tuples, plus metadata such as `prompt_version`,
-`context_ids`, `retrieval_candidates`, `tool_latency_ms`, `verifier_score`,
-`reflection_delta`, and optional `user_feedback`.
+Each row in `rl_transitions` carries `(state, action, observation,
+reward)` plus metadata: `prompt_version`, `context_ids`,
+`retrieval_candidates`, `tool_latency_ms`, `verifier_score`,
+`reflection_delta`, optional `user_feedback`.
+
+### Honest framing: what `rl_transitions` is and isn't
+
+The schema was chosen to make these rows easy to replay for future
+offline RL work, but **no training loop consumes them today**. There is
+no replay buffer, no policy update, no behavior change informed by past
+rewards. `reflection_roi` is computed for visibility but nothing feeds
+it back into planner behavior on the next run.
+
+In practice, `rl_transitions` is **structured per-step run logs with
+reward annotation** — useful as an audit trail, a dataset for future
+offline training, or an input to a dashboard. It is not reinforcement
+learning.
+
+### OpenTelemetry (optional)
 
 When `AGENTOS_ENABLE_OTEL=true`, the trace store also dual-writes spans
-through an optional OpenTelemetry bridge so the same run can be viewed in a
+through an OpenTelemetry bridge so the same run can be viewed in a
 tracing backend such as Phoenix.
 
-The static UI at `/` renders runs and their traces directly from these rows,
-and the Next.js console gives you a richer operator workflow.
+The static UI at `/` renders runs and their traces directly from these
+rows; the Next.js console gives you a richer operator workflow.
 
 ---
 
 ## Reliability
 
-- Planner output is parsed with a tolerant regex + JSON fallback — if the LLM
-  ignores the schema, the raw text is treated as the final answer.
-- Ollama backend retries with exponential backoff.
+- Planner output is parsed with a tolerant regex + JSON fallback — if
+  the LLM ignores the schema, the raw text is treated as the final answer.
+- Ollama backend retries with exponential backoff (120s+ timeout for
+  cloud models).
 - Tools wrap every call in try/except and return a uniform
   `{status, output, error}` dict.
 - Empty or whitespace-only input is rejected before the loop runs.
-- Config patches rebuild the tool registry so flag flips take effect on the
-  next request.
+- `memory.add(ttl_seconds=0)` now raises `ValueError` instead of
+  silently writing a row that expires immediately.
+- `/config` patches build a fresh components bundle from the new
+  settings and swap `app.state.components` atomically under a lock, so
+  in-flight requests keep consistent settings.
+- Legacy memory DBs (pre-tiered schema) are migrated on startup: the
+  old `memory_fts` virtual table is dropped and rebuilt with the new
+  `(text, kind)` columns.
 
 ---
 
 ## Limitations (honest edition)
 
-- **Heuristic scorer.** The in-loop scorer is a simple grounding proxy; it
-  can over-reward verbose answers and under-reward terse correct ones. Use
-  `expected_contains` in benchmarks for real signal.
-- **MockLLM is not an LLM.** It is a stub so the loop is runnable and
-  testable without a model. Non-trivial reasoning requires Ollama or a
-  hosted backend.
-- **Memory is still keyword-first.** The runtime now distinguishes working,
-  episodic, and semantic tiers, but retrieval is still FTS5 rather than
-  embedding-based search.
+- **MockLLM is a stub, not a model.** Its `_direct_answer` table
+  contains hard-coded strings that match the benchmark expectations.
+  Real reasoning requires Ollama or another real backend.
+- **The heuristic scorer is a weak signal.** It is no longer used as a
+  promotion gate — only `expected_contains` or a passing LLM-judge
+  verdict can promote to durable memory. But the score itself still
+  drives the reflection trigger, which means reflection can fire
+  spuriously on a verbose answer. Turn on `enable_llm_judge` for a
+  meaningful verification signal.
+- **Memory is still keyword-first.** Tiered working/episodic/semantic
+  storage is in place, but retrieval uses SQLite FTS5 — not embeddings.
 - **Tools are minimal.** Calculator + HTTP fetch + optional Tavily. The
-  registry is designed so adding tools is ~20 lines, not a refactor.
-- **No multi-agent orchestration.** One loop, one agent. Multi-agent is not
-  claimed.
-- **Trace payloads are truncated** at 8 KB to keep SQLite fast; full payloads
-  are not preserved.
+  registry is designed so adding a tool is ~20 lines, not a refactor.
+- **No multi-agent orchestration.** One loop, one agent.
+- **Trace payloads are truncated at 8 KB** to keep SQLite fast; full
+  payloads are not preserved.
+- **`rl_transitions` is not RL.** It's reward-annotated run logs. See
+  [Logging & observability](#logging--observability).
+- **Context packer budgets** (`0.18 / 0.16 / 0.28` splits between
+  developer prompt, scratchpad, and tools) are hand-tuned, not
+  empirically validated via the ablation framework. If you care about
+  this, it's a natural next ablation to add.
 
 ---
 
 ## Environment variables
 
-All prefixed with `AGENTOS_`. See `.env.example` for the full list. The most
-important ones:
+All prefixed with `AGENTOS_`. See `.env.example` for the full list. The
+most important ones:
 
-| Variable                    | Default  | Notes                              |
-|-----------------------------|----------|------------------------------------|
-| `AGENTOS_PROFILE`           | minimal  | `minimal` or `full`                |
-| `AGENTOS_LLM_BACKEND`       | mock     | `mock` or `ollama`                 |
-| `AGENTOS_DB_PATH`           | `./data/agentos.db` | SQLite file            |
-| `AGENTOS_PROMPT_VERSION`    | `react-context-v1` | prompt/schema version    |
-| `AGENTOS_MAX_STEPS`         | 4        | max planner/executor iterations    |
-| `AGENTOS_EVAL_PASS_THRESHOLD` | 0.6    | score threshold for completion     |
-| `AGENTOS_CONTEXT_CHAR_BUDGET` | 8000   | total context packer budget        |
-| `AGENTOS_MEMORY_SEARCH_K`   | 8        | retrieved memories per query       |
-| `AGENTOS_MEMORY_MIN_SALIENCE` | 0.15   | drop weak memories before packing  |
-| `AGENTOS_WORKING_MEMORY_TTL_SECONDS` | 3600 | short-lived scratch memory   |
-| `AGENTOS_EPISODIC_MEMORY_TTL_SECONDS` | 1209600 | durable run memory     |
-| `AGENTOS_ENABLE_MEMORY`     | true     |                                    |
-| `AGENTOS_ENABLE_PLANNER`    | true     |                                    |
-| `AGENTOS_ENABLE_TOOLS`      | true     |                                    |
-| `AGENTOS_ENABLE_REFLECTION` | true     |                                    |
-| `AGENTOS_ENABLE_OTEL`       | false    | dual-write traces to OTel          |
-| `AGENTOS_OTEL_SERVICE_NAME` | `agentos-core` | span service name             |
-| `AGENTOS_OTEL_EXPORTER_OTLP_ENDPOINT` | empty | optional OTLP endpoint     |
+| Variable                    | Default              | Notes                              |
+|-----------------------------|----------------------|------------------------------------|
+| `AGENTOS_PROFILE`           | minimal              | `minimal` (mock) or `full` (ollama + judge) |
+| `AGENTOS_LLM_BACKEND`       | mock                 | `mock` or `ollama`                 |
+| `AGENTOS_OLLAMA_MODEL`      | `gemma4:31b-cloud`   | any Ollama tag; `*-cloud` = cloud  |
+| `AGENTOS_OLLAMA_API_KEY`    | empty                | only for proxy-auth'd endpoints    |
+| `AGENTOS_DB_PATH`           | `./data/agentos.db`  | SQLite file                        |
+| `AGENTOS_PROMPT_VERSION`    | `react-context-v1`   | prompt/schema version              |
+| `AGENTOS_MAX_STEPS`         | 4                    | max planner/executor iterations    |
+| `AGENTOS_EVAL_PASS_THRESHOLD` | 0.6                | score threshold for completion     |
+| `AGENTOS_CONTEXT_CHAR_BUDGET` | 8000               | total context packer budget        |
+| `AGENTOS_MEMORY_SEARCH_K`   | 8                    | retrieved memories per query       |
+| `AGENTOS_MEMORY_MIN_SALIENCE` | 0.15               | drop weak memories before packing  |
+| `AGENTOS_WORKING_MEMORY_TTL_SECONDS` | 3600        | short-lived scratch memory         |
+| `AGENTOS_EPISODIC_MEMORY_TTL_SECONDS` | 1209600    | durable run memory                 |
+| `AGENTOS_ENABLE_MEMORY`     | true                 |                                    |
+| `AGENTOS_ENABLE_PLANNER`    | true                 |                                    |
+| `AGENTOS_ENABLE_TOOLS`      | true                 |                                    |
+| `AGENTOS_ENABLE_REFLECTION` | true                 |                                    |
+| `AGENTOS_ENABLE_LLM_JUDGE`  | false (auto-on in full) | LLM-as-judge for live runs      |
+| `AGENTOS_ENABLE_OTEL`       | false                | dual-write traces to OTel          |
+| `AGENTOS_OTEL_SERVICE_NAME` | `agentos-core`       | span service name                  |
+| `AGENTOS_OTEL_EXPORTER_OTLP_ENDPOINT` | empty      | optional OTLP endpoint             |
 
 ---
 

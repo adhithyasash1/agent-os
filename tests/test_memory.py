@@ -1,3 +1,5 @@
+import pytest
+
 from agentos.memory.store import MEMORY_KINDS
 
 
@@ -40,6 +42,14 @@ def test_stats_return_all_memory_tiers(memory):
     stats = memory.stats()
     assert stats["count"] == 0
     assert set(stats["by_kind"].keys()) == set(MEMORY_KINDS)
+
+
+def test_add_rejects_nonpositive_ttl(memory):
+    with pytest.raises(ValueError):
+        memory.add("should be rejected", ttl_seconds=0)
+    with pytest.raises(ValueError):
+        memory.add("also rejected", ttl_seconds=-5)
+    assert memory.count() == 0
 
 
 def test_promote_verified_fact_writes_episodic_and_semantic(memory):

@@ -188,9 +188,15 @@ class MemoryStore:
         verifier_score: float | None = None,
     ) -> int:
         kind = _normalize_kind(kind)
+        if ttl_seconds is not None and ttl_seconds <= 0:
+            # Reject silently-expiring writes. Callers that want "no TTL"
+            # must pass None (or rely on the kind default).
+            raise ValueError(
+                f"ttl_seconds must be positive or None, got {ttl_seconds}"
+            )
         ttl_value = DEFAULT_TTLS[kind] if ttl_seconds is None else ttl_seconds
         now = time.time()
-        expires_at = None if ttl_value is None else now + max(int(ttl_value), 0)
+        expires_at = None if ttl_value is None else now + int(ttl_value)
         with self._conn() as c:
             cur = c.execute(
                 """

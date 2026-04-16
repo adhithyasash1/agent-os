@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api import api_router, get_components
+from .api import api_router, build_components
 from .config import settings
 
 
@@ -23,7 +23,7 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_components()
+    app.state.components = build_components(settings)
     logging.getLogger("agentos").info(
         "agentos-core ready — profile=%s backend=%s",
         settings.profile, settings.llm_backend,

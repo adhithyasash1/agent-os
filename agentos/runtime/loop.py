@@ -6,7 +6,7 @@ from typing import Any
 
 from ..config import Settings, settings as default_settings
 from ..eval.reflection import reflect
-from ..eval.scorer import score_answer_details
+from ..eval.scorer import llm_judge, score_answer_details
 from ..llm.protocol import LLM
 from ..memory.store import MemoryStore
 from ..tools.registry import ToolRegistry
@@ -351,6 +351,17 @@ async def run_agent(
                 current_pack.grounding_context,
                 expected=expected,
             )
+            if (
+                verification["mode"] == "heuristic"
+                and cfg.enable_llm_judge
+                and expected is None
+            ):
+                verification = await llm_judge(
+                    llm,
+                    user_input,
+                    answer,
+                    current_pack.grounding_context,
+                )
             score = float(verification["score"])
             if initial_score_value is None:
                 initial_score_value = score
@@ -446,7 +457,11 @@ async def run_agent(
                 verifier_score=score,
                 meta={"stage": "final_candidate"},
             )
-            if score >= cfg.eval_pass_threshold and answer.strip():
+            if (
+                score >= cfg.eval_pass_threshold
+                and answer.strip()
+                and verification.get("trustworthy")
+            ):
                 memory.promote_verified_fact(
                     user_input=user_input,
                     answer=answer,

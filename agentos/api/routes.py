@@ -1,13 +1,21 @@
-"""HTTP API for agentos-core."""
+"""HTTP API for agentos-core.
+
+Components are built once at application startup (see `agentos.main`) and
+stashed on `app.state`. Every request pulls them via the `Depends(...)`
+mechanism, so we never mutate a process-global singleton under async load.
+A `_config_lock` serializes `/config` patches — the handler builds a fresh
+`Components` bundle from the patched settings and atomically swaps it in.
+"""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from ..config import Settings, settings
+from ..config import Settings
 from ..llm import build_llm
 from ..llm.protocol import LLM
 from ..memory.store import MemoryStore
@@ -24,21 +32,24 @@ class Components:
     traces: TraceStore
 
 
-_components: Components | None = None
+def build_components(settings: Settings) -> Components:
+    return Components(
+        settings=settings,
+        llm=build_llm(settings),
+        memory=MemoryStore(settings.db_path),
+        tools=build_default_registry(settings),
+        traces=TraceStore(settings.db_path, config=settings),
+    )
 
 
-def get_components() -> Components:
-    global _components
-    if _components is None:
-        _components = Components(
-            settings=settings,
-            llm=build_llm(settings),
-            memory=MemoryStore(settings.db_path),
-            tools=build_default_registry(settings),
-            traces=TraceStore(settings.db_path, config=settings),
-        )
-    return _components
+def get_components(request: Request) -> Components:
+    components = getattr(request.app.state, "components", None)
+    if components is None:
+        raise HTTPException(500, "components not initialized")
+    return components
 
+
+_config_lock = asyncio.Lock()
 
 api_router = APIRouter()
 
@@ -52,6 +63,7 @@ class ConfigPatch(BaseModel):
     enable_planner: bool | None = None
     enable_tools: bool | None = None
     enable_reflection: bool | None = None
+    enable_llm_judge: bool | None = None
     enable_otel: bool | None = None
 
 
@@ -68,8 +80,7 @@ class RunFeedbackRequest(BaseModel):
 
 
 @api_router.post("/runs")
-async def create_run(req: RunRequest):
-    c = get_components()
+async def create_run(req: RunRequest, c: Components = Depends(get_components)):
     result = await run_agent(
         req.input,
         llm=c.llm,
@@ -100,14 +111,12 @@ async def create_run(req: RunRequest):
 
 
 @api_router.get("/runs")
-async def list_runs(limit: int = 50):
-    c = get_components()
+async def list_runs(limit: int = 50, c: Components = Depends(get_components)):
     return c.traces.list_runs(limit=limit)
 
 
 @api_router.get("/runs/{run_id}")
-async def get_run(run_id: str):
-    c = get_components()
+async def get_run(run_id: str, c: Components = Depends(get_components)):
     run = c.traces.get_run(run_id)
     if not run:
         raise HTTPException(404, "run not found")
@@ -115,8 +124,11 @@ async def get_run(run_id: str):
 
 
 @api_router.post("/runs/{run_id}/feedback")
-async def leave_feedback(run_id: str, req: RunFeedbackRequest):
-    c = get_components()
+async def leave_feedback(
+    run_id: str,
+    req: RunFeedbackRequest,
+    c: Components = Depends(get_components),
+):
     if not c.traces.get_run(run_id):
         raise HTTPException(404, "run not found")
     feedback = req.model_dump(exclude_none=True)
@@ -125,19 +137,23 @@ async def leave_feedback(run_id: str, req: RunFeedbackRequest):
 
 
 @api_router.get("/traces/{run_id}")
-async def get_trace(run_id: str):
-    return await get_run(run_id)
+async def get_trace(run_id: str, c: Components = Depends(get_components)):
+    run = c.traces.get_run(run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    return run
 
 
 @api_router.get("/memory/stats")
-async def memory_stats():
-    c = get_components()
+async def memory_stats(c: Components = Depends(get_components)):
     return c.memory.stats()
 
 
 @api_router.post("/memory/search")
-async def memory_search(req: MemorySearchRequest):
-    c = get_components()
+async def memory_search(
+    req: MemorySearchRequest,
+    c: Components = Depends(get_components),
+):
     return {
         "results": c.memory.search(
             req.query,
@@ -149,8 +165,7 @@ async def memory_search(req: MemorySearchRequest):
 
 
 @api_router.get("/tools")
-async def list_tools():
-    c = get_components()
+async def list_tools(c: Components = Depends(get_components)):
     return [
         {"name": t.name, "description": t.description, "args": t.args_schema}
         for t in c.tools.list()
@@ -158,27 +173,56 @@ async def list_tools():
 
 
 @api_router.get("/config")
-async def get_config():
-    c = get_components()
+async def get_config(c: Components = Depends(get_components)):
     return c.settings.describe()
 
 
 @api_router.post("/config")
-async def patch_config(patch: ConfigPatch):
-    c = get_components()
-    changed = {}
-    for field, val in patch.model_dump(exclude_none=True).items():
-        old = getattr(c.settings, field)
-        setattr(c.settings, field, val)
-        changed[field] = {"old": old, "new": val}
-    c.tools = build_default_registry(c.settings)
-    c.traces = TraceStore(c.settings.db_path, config=c.settings)
-    return {"updated": changed, "current": c.settings.describe()}
+async def patch_config(patch: ConfigPatch, request: Request):
+    """Patch feature flags atomically.
+
+    Builds a fresh Settings + Components bundle from the patched values
+    and swaps `app.state.components` under a lock. In-flight requests keep
+    the components reference they already resolved through Depends, so
+    they finish with consistent settings rather than half-patched state.
+    """
+    async with _config_lock:
+        current: Components = request.app.state.components
+        changes = patch.model_dump(exclude_none=True)
+        if not changes:
+            return {"updated": {}, "current": current.settings.describe()}
+
+        updates: dict[str, dict[str, Any]] = {
+            field: {"old": getattr(current.settings, field), "new": val}
+            for field, val in changes.items()
+        }
+        new_settings = _clone_settings(current.settings, changes)
+
+        new_components = Components(
+            settings=new_settings,
+            llm=current.llm,  # LLM swap is not exposed through this endpoint
+            memory=current.memory,
+            tools=build_default_registry(new_settings),
+            traces=TraceStore(new_settings.db_path, config=new_settings),
+        )
+        request.app.state.components = new_components
+        return {"updated": updates, "current": new_settings.describe()}
+
+
+def _clone_settings(settings: Settings, overrides: dict[str, Any]) -> Settings:
+    data = settings.model_dump()
+    data.update(overrides)
+    clone = Settings(**data)
+    clone.apply_profile()
+    # apply_profile may undo some overrides (e.g. forcing mock in minimal);
+    # re-apply explicit overrides so patch intent wins.
+    for key, value in overrides.items():
+        setattr(clone, key, value)
+    return clone
 
 
 @api_router.get("/health")
-async def health():
-    c = get_components()
+async def health(c: Components = Depends(get_components)):
     deps = {"memory": "ok", "traces": "ok"}
     try:
         _ = c.memory.count()
@@ -188,9 +232,15 @@ async def health():
     if c.settings.llm_backend == "ollama":
         import httpx
 
+        headers = {}
+        if c.settings.ollama_api_key:
+            headers["Authorization"] = f"Bearer {c.settings.ollama_api_key}"
         try:
             async with httpx.AsyncClient(timeout=2) as client:
-                r = await client.get(f"{c.settings.ollama_base_url}/api/tags")
+                r = await client.get(
+                    f"{c.settings.ollama_base_url}/api/tags",
+                    headers=headers,
+                )
             deps["ollama"] = "ok" if r.status_code == 200 else "error"
         except Exception:
             deps["ollama"] = "unreachable"

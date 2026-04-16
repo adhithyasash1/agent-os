@@ -1,8 +1,11 @@
 """Configuration loaded from environment variables with profile support.
 
 Two profiles:
-  - minimal: runs with zero external services. Mock LLM, SQLite, one builtin tool.
-  - full:    enables Ollama LLM + optional feature flags.
+  - minimal: offline demo. Mock LLM, SQLite, one builtin tool. No network.
+  - full:    enables an Ollama backend (local or cloud) and optional tools.
+
+The profile actually rewrites behavior (see `apply_profile`): it flips the
+relevant feature flags rather than being a documentation-only label.
 
 All feature toggles are explicit fields so ablations are just env overrides.
 """
@@ -26,7 +29,11 @@ class Settings(BaseSettings):
     # LLM
     llm_backend: str = Field(default="mock", description="mock | ollama")
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "qwen3.5:397b-cloud"
+    ollama_model: str = "gemma4:31b-cloud"
+    # Optional API key header, for cases where the Ollama endpoint is
+    # behind an auth-proxy. For cloud models via the local daemon the
+    # user runs `ollama signin` instead and leaves this empty.
+    ollama_api_key: str = ""
 
     # Storage
     db_path: str = "./data/agentos.db"
@@ -37,6 +44,7 @@ class Settings(BaseSettings):
     enable_planner: bool = True
     enable_tools: bool = True
     enable_reflection: bool = True
+    enable_llm_judge: bool = False  # use LLM-as-judge for live verification
     enable_otel: bool = False
 
     # Optional integrations
@@ -60,9 +68,25 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:8000"]
 
     def apply_profile(self) -> None:
-        """Force dependency-heavy features off in minimal profile."""
+        """Apply profile-derived defaults.
+
+        This is the behavioral difference between `minimal` and `full`:
+
+        - minimal: zero-network demo. Force mock LLM, disable HTTP fetch,
+          disable Tavily, disable LLM-as-judge. Tests run here.
+        - full: enable the LLM judge (for live verification), keep HTTP
+          fetch available, auto-switch to ollama when the backend has
+          been left at its mock default.
+        """
         if self.profile == "minimal":
+            self.llm_backend = "mock"
+            self.enable_http_fetch = False
             self.enable_tavily = False
+            self.enable_llm_judge = False
+        elif self.profile == "full":
+            if self.llm_backend == "mock":
+                self.llm_backend = "ollama"
+            self.enable_llm_judge = True
 
     def describe(self) -> dict:
         return {
@@ -74,6 +98,7 @@ class Settings(BaseSettings):
                 "planner": self.enable_planner,
                 "tools": self.enable_tools,
                 "reflection": self.enable_reflection,
+                "llm_judge": self.enable_llm_judge,
                 "http_fetch": self.enable_http_fetch,
                 "tavily": self.enable_tavily,
                 "otel": self.enable_otel,

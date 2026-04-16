@@ -10,5 +10,6 @@ def build_llm(settings) -> LLM:
         return OllamaLLM(
             base_url=settings.ollama_base_url,
             model=settings.ollama_model,
+            api_key=settings.ollama_api_key or None,
         )
     return MockLLM()

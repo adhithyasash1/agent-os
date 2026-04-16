@@ -1,27 +1,30 @@
-"""API endpoint tests. Uses FastAPI TestClient."""
+"""API endpoint tests. Uses FastAPI TestClient.
+
+Because components are built at lifespan startup and injected via
+`Depends`, we can build a fresh app per test with no module reloads.
+"""
 from __future__ import annotations
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+from agentos.api import api_router, build_components
+from agentos.config import Settings
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGENTOS_DB_PATH", str(tmp_path / "api.db"))
-    monkeypatch.setenv("AGENTOS_LLM_BACKEND", "mock")
-    monkeypatch.setenv("AGENTOS_PROFILE", "minimal")
-
-    import importlib
-    from agentos import config as config_mod
-
-    importlib.reload(config_mod)
-    from agentos.api import routes as routes_mod
-
-    importlib.reload(routes_mod)
-    from agentos import main as main_mod
-
-    importlib.reload(main_mod)
-    return TestClient(main_mod.app)
+def client(tmp_path):
+    settings = Settings(
+        db_path=str(tmp_path / "api.db"),
+        llm_backend="mock",
+        profile="minimal",
+    )
+    settings.apply_profile()
+    app = FastAPI(title="agentos-core-test")
+    app.include_router(api_router, prefix=settings.api_prefix)
+    app.state.components = build_components(settings)
+    return TestClient(app)
 
 
 def test_health(client):
@@ -83,6 +86,16 @@ def test_config_patch(client):
     assert r.status_code == 200
     body = r.json()
     assert body["current"]["flags"]["tools"] is False
+    assert body["updated"]["enable_tools"] == {"old": True, "new": False}
+
+    r2 = client.get("/api/v1/config")
+    assert r2.json()["flags"]["tools"] is False
+
+
+def test_config_patch_empty_is_noop(client):
+    r = client.post("/api/v1/config", json={})
+    assert r.status_code == 200
+    assert r.json()["updated"] == {}
 
 
 def test_feedback_endpoint(client):
