@@ -1,12 +1,4 @@
-"""Deterministic mock LLM.
-
-Used by tests and the minimal profile so the project runs with zero external
-services. Recognises a handful of patterns from the planner prompt and from
-direct answer prompts, and produces plausible outputs.
-
-This is NOT an attempt at intelligence — it is a stable stub so the agent
-loop, tool calls, and memory paths can be exercised end-to-end.
-"""
+"""Deterministic mock LLM."""
 from __future__ import annotations
 
 import json
@@ -21,83 +13,79 @@ class MockLLM:
         self._calls += 1
         p = prompt.lower()
 
-        # Planner prompt — respond with structured JSON
-        if "respond in json only" in p or "action" in p and "tool" in p and "rationale" in p:
+        if "respond in json only" in p and "observation_summary" in p and "confidence" in p:
             return self._plan(prompt)
 
-        # Reflection prompt — emit a short critique
         if "critique" in p and ("answer" in p or "response" in p):
-            return "Answer could be more specific and grounded in context."
+            return "The answer is a bit thin. Ground it more clearly in the available context."
 
-        # Default: extract key phrase and echo
         return self._direct_answer(prompt)
-
-    # --- internals ---
 
     def _plan(self, prompt: str) -> str:
         user_line = self._extract_user(prompt)
         user = user_line.lower()
+        tool_section = _extract_section(prompt, "Prior tool results:", ("Prior critique:", "User request:"))
+        has_prior_tool = tool_section.strip() not in ("(none)", "")
 
-        # If a tool was already called, answer from its output
-        tool_section = re.search(
-            r"prior tool results.*?:\s*(.*?)(?:prior critique|user request)",
-            prompt, re.DOTALL | re.IGNORECASE,
-        )
-        has_prior_tool = tool_section and tool_section.group(1).strip() not in ("(none)", "")
-
-        # Arithmetic → calculator (only if not already called)
-        if not has_prior_tool and (
-            re.search(r"\b(\d+\s*[\+\-\*/]\s*\d+)", user) or "calculate" in user
-        ) and "calculator" in prompt:
+        if not has_prior_tool and _looks_like_arithmetic_request(user_line) and "calculator" in prompt:
             expr_match = re.search(r"[\d\s\+\-\*/\(\)\.]+", user_line)
             return json.dumps({
+                "goal": "Compute the arithmetic result accurately.",
                 "action": "call_tool",
                 "tool": "calculator",
                 "tool_args": {"expression": (expr_match.group(0) if expr_match else user_line).strip()},
-                "rationale": "arithmetic detected",
+                "rationale": "Arithmetic was detected and the calculator is safer than guessing.",
+                "observation_summary": "Get the numeric result from the calculator.",
+                "confidence": 0.92,
+                "stop_reason": "Need the tool result before answering.",
                 "answer": None,
             })
 
-        # URL → http_fetch (only if not already called)
         url_match = re.search(r"https?://\S+", user_line)
         if not has_prior_tool and url_match and "http_fetch" in prompt:
             return json.dumps({
+                "goal": "Fetch the page the user referenced.",
                 "action": "call_tool",
                 "tool": "http_fetch",
                 "tool_args": {"url": url_match.group(0)},
-                "rationale": "url detected",
+                "rationale": "The answer depends on a URL that should be fetched.",
+                "observation_summary": "Retrieve the page body for grounding.",
+                "confidence": 0.88,
+                "stop_reason": "Need the HTTP response before answering.",
                 "answer": None,
             })
 
-        # Tool results present → fabricate an answer that includes the output
         if has_prior_tool:
-            out_match = re.search(r"ok.*?:\s*(.+)", tool_section.group(1))
-            tool_out = (out_match.group(1).strip() if out_match
-                        else tool_section.group(1).strip())[:200]
+            out_match = re.search(r"ok.*?:\s*(.+)", tool_section, re.IGNORECASE)
+            tool_out = (out_match.group(1).strip() if out_match else tool_section.strip())[:220]
             return json.dumps({
+                "goal": "Answer the user with the observed tool result.",
                 "action": "answer",
                 "tool": None,
                 "tool_args": {},
-                "rationale": "tool result in hand",
+                "rationale": "A relevant tool result is already available.",
+                "observation_summary": tool_out,
+                "confidence": 0.9,
+                "stop_reason": "The tool result is sufficient to answer.",
                 "answer": f"The result is {tool_out}.",
             })
 
-        # Prefer direct-answer knowledge; fall back to context if present
         answer = self._direct_answer(user_line)
         if answer.startswith("I don't have enough"):
-            ctx_match = re.search(
-                r"retrieved context.*?:\s*(.*?)(?:prior tool|user request)",
-                prompt, re.DOTALL | re.IGNORECASE,
-            )
-            if ctx_match:
-                ctx = ctx_match.group(1).strip()
-                if ctx and ctx not in ("(none)", "(empty)"):
-                    answer = ctx[:400]
+            ctx = _extract_section(prompt, "Context packet:", ("Prior tool results:", "Prior critique:", "User request:"))
+            if ctx and ctx not in ("(none)", "(empty)"):
+                candidate = _best_grounded_context_line(ctx)
+                if candidate:
+                    answer = candidate
         return json.dumps({
+            "goal": "Answer the user from existing knowledge or retrieved context.",
             "action": "answer",
             "tool": None,
             "tool_args": {},
-            "rationale": "answered from context/knowledge",
+            "rationale": "The answer can be produced without another tool call.",
+            "observation_summary": "Use the strongest matching context available.",
+            "confidence": 0.62 if "don't have enough" not in answer.lower() else 0.34,
+            "stop_reason": "No additional tool call is necessary.",
             "answer": answer,
         })
 
@@ -112,20 +100,81 @@ class MockLLM:
 
     def _direct_answer(self, prompt: str) -> str:
         q = self._extract_user(prompt).lower()
-        # Tiny knowledge stub so benchmark tests have *some* signal
         table = {
             "capital of france": "The capital of France is Paris.",
             "binary search": "Binary search runs in O(log n) time.",
             "list and a tuple": "Lists are mutable; tuples are immutable in Python.",
-            "acid": "ACID: Atomicity, Consistency, Isolation, Durability.",
+            "acid": "ACID stands for Atomicity, Consistency, Isolation, and Durability.",
             "rest api": "A REST API exposes resources over HTTP using standard verbs.",
-            "supervised": "Supervised learning uses labeled data; unsupervised does not.",
+            "supervised": "Supervised learning uses labeled data, while unsupervised learning does not.",
             "median": "Sorted: 1, 2, 4, 5, 7, 8, 9. Median is 5.",
-            "probability both are red": "3/10 (= 0.3 = 30%).",
+            "probability both are red": "3/10, which is 0.3 or 30%.",
             "answer to life": "42.",
             "center": "5.",
+            "37 a prime": "37 is prime.",
         }
         for key, val in table.items():
             if key in q:
                 return val
         return "I don't have enough information to answer confidently."
+
+
+def _extract_section(prompt: str, header: str, next_headers: tuple[str, ...]) -> str:
+    next_pattern = "|".join(re.escape(item) for item in next_headers)
+    pattern = rf"(?ims)^{re.escape(header)}\s*(.*?)(?=^(?:{next_pattern})|\Z)"
+    match = re.search(pattern, prompt)
+    return match.group(1).strip() if match else ""
+
+
+def _best_grounded_context_line(context: str) -> str:
+    durable_memory_lines: list[str] = []
+    tool_lines: list[str] = []
+    in_memory_block = False
+    capture_memory = False
+    in_tool_block = False
+    for line in context.splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        if cleaned.startswith("<memory"):
+            in_memory_block = True
+            kind_match = re.search(r'kind="([^"]+)"', cleaned, re.IGNORECASE)
+            kind = (kind_match.group(1).lower() if kind_match else "working")
+            capture_memory = kind in {"episodic", "semantic"}
+            continue
+        if cleaned.startswith("</memory>"):
+            in_memory_block = False
+            capture_memory = False
+            continue
+        if cleaned.startswith("<tool_observation"):
+            in_tool_block = True
+            continue
+        if cleaned.startswith("</tool_observation>"):
+            in_tool_block = False
+            continue
+        if in_memory_block and capture_memory:
+            durable_memory_lines.append(cleaned[:400])
+            continue
+        if in_tool_block and ":" in cleaned:
+            label, value = cleaned.split(":", 1)
+            if label.lower() in {"summary", "output"} and value.strip():
+                tool_lines.append(value.strip()[:400])
+    if durable_memory_lines:
+        return durable_memory_lines[0]
+    if tool_lines:
+        return tool_lines[0]
+    return ""
+
+
+def _looks_like_arithmetic_request(user_line: str) -> bool:
+    user = user_line.lower()
+    if "calculate" in user:
+        return True
+    if any(word in user for word in ("sentence", "sentences", "version", "step")):
+        return False
+    expr = re.search(r"\b\d+\s*[\+\*/]\s*\d+", user)
+    if expr:
+        return True
+    if re.search(r"\b\d+\s*-\s*\d+\b", user) and any(word in user for word in ("result", "equals", "what is")):
+        return True
+    return False

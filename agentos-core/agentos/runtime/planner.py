@@ -1,19 +1,9 @@
-"""Planner: decides the next step.
-
-Given the user input, retrieved context, and tool outputs so far, the planner
-returns a PlanDecision with one of three actions:
-  - call_tool: execute a registered tool
-  - answer:    produce a final answer
-  - refine:    re-plan using prior critique
-
-The decision is made by asking the LLM for a small JSON blob. We keep the
-prompt tiny so mock LLMs and small local models can follow it.
-"""
+"""Planner for the ReAct-style agent loop."""
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..llm.protocol import LLM
@@ -22,41 +12,65 @@ from ..tools.registry import ToolRegistry
 
 @dataclass
 class PlanDecision:
-    action: str  # "call_tool" | "answer" | "refine"
+    goal: str = ""
+    action: str = "answer"  # "call_tool" | "answer"
     tool: str | None = None
-    tool_args: dict | None = None
+    tool_args: dict = field(default_factory=dict)
     rationale: str = ""
+    observation_summary: str = ""
+    confidence: float = 0.0
+    stop_reason: str = ""
     answer: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "goal": self.goal,
+            "action": self.action,
+            "tool": self.tool,
+            "tool_args": self.tool_args,
+            "rationale": self.rationale,
+            "observation_summary": self.observation_summary,
+            "confidence": self.confidence,
+            "stop_reason": self.stop_reason,
+            "answer": self.answer,
+        }
 
 
 PLANNER_PROMPT = """You are the planner for a local agent runtime.
-Goal: decide the next step for the user's request.
+Think in a ReAct-style loop: goal -> action -> observation -> answer.
 
 Available tools:
 {tool_list}
 
-Retrieved context (may be empty):
+Context packet:
 {context}
 
-Prior tool results (may be empty):
+Prior tool results:
 {tool_results}
 
-Prior critique (only present on refine):
+Prior critique:
 {critique}
 
 User request: {user_input}
 
 Respond in JSON only with this schema:
-{{"action": "call_tool" | "answer",
+{{
+  "goal": "<what must be solved right now>",
+  "action": "call_tool" | "answer",
   "tool": "<tool_name or null>",
   "tool_args": {{...}},
-  "rationale": "<one sentence>",
-  "answer": "<final answer if action=answer, else null>"}}
+  "rationale": "<brief reason for the action>",
+  "observation_summary": "<what you expect to learn or what you already learned>",
+  "confidence": <float 0..1>,
+  "stop_reason": "<why this step should stop and hand off>",
+  "answer": "<final answer if action=answer, else null>"
+}}
 
 Rules:
-- Prefer "answer" when you can respond from existing context.
-- Use "call_tool" only when a tool is clearly needed.
-- Keep answers grounded in the provided context when it is relevant.
+- Use "call_tool" only when a tool is clearly necessary.
+- Prefer grounded answers from the supplied context packet when possible.
+- Keep confidence honest.
+- If you answer directly, set stop_reason to why another tool or step is unnecessary.
 """
 
 
@@ -71,7 +85,7 @@ async def plan_next_step(
     tool_list = tools.describe() or "(no tools enabled)"
     prompt = PLANNER_PROMPT.format(
         tool_list=tool_list,
-        context=context[:2000] or "(none)",
+        context=context[:4000] or "(none)",
         tool_results=_summarize_tool_results(tool_results),
         critique=critique or "(none)",
         user_input=user_input,
@@ -93,21 +107,39 @@ def _summarize_tool_results(results: list[dict]) -> str:
 
 
 def _parse_decision(raw: str) -> PlanDecision:
-    """Robust JSON extraction. Falls back to plain answer."""
     text = raw.strip()
-    # Strip fenced code
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
         try:
-            data = json.loads(m.group(0))
+            data = json.loads(match.group(0))
             return PlanDecision(
-                action=data.get("action", "answer"),
+                goal=str(data.get("goal") or "").strip(),
+                action=str(data.get("action") or "answer").strip() or "answer",
                 tool=data.get("tool") or None,
                 tool_args=data.get("tool_args") or {},
-                rationale=data.get("rationale", ""),
+                rationale=str(data.get("rationale") or "").strip(),
+                observation_summary=str(data.get("observation_summary") or "").strip(),
+                confidence=_as_confidence(data.get("confidence")),
+                stop_reason=str(data.get("stop_reason") or "").strip(),
                 answer=data.get("answer"),
             )
         except json.JSONDecodeError:
             pass
-    # Fallback: treat whole text as final answer
-    return PlanDecision(action="answer", answer=text, rationale="parser fallback")
+    return PlanDecision(
+        goal="Answer the user directly.",
+        action="answer",
+        tool=None,
+        tool_args={},
+        rationale="planner parser fallback",
+        observation_summary="No structured planner output was available.",
+        confidence=0.2,
+        stop_reason="fallback_to_plain_answer",
+        answer=text,
+    )
+
+
+def _as_confidence(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except Exception:
+        return 0.0

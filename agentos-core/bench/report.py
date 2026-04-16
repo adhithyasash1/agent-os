@@ -1,24 +1,18 @@
-"""Turn benchmark JSON results into a single markdown report.
-
-Usage:
-  python -m bench.report              # uses bench/results/*.json
-  python -m bench.report --out report.md
-"""
+"""Turn benchmark JSON results into a markdown report."""
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def load_all(results_dir: Path) -> list[dict]:
     summaries = []
-    for f in sorted(results_dir.glob("*.json")):
+    for file in sorted(results_dir.glob("*.json")):
         try:
-            summaries.append(json.loads(f.read_text()))
+            summaries.append(json.loads(file.read_text()))
         except Exception:
             continue
     return summaries
@@ -28,77 +22,88 @@ def render(summaries: list[dict]) -> str:
     if not summaries:
         return "# Benchmark report\n\nNo results found.\n"
 
-    # Keep most recent run per label
     latest: dict[str, dict] = {}
-    for s in summaries:
-        key = s.get("label", "unknown")
-        if key not in latest or s["timestamp"] > latest[key]["timestamp"]:
-            latest[key] = s
+    for summary in summaries:
+        key = summary.get("label", "unknown")
+        if key not in latest or summary["timestamp"] > latest[key]["timestamp"]:
+            latest[key] = summary
 
     order = ["full", "no-memory", "no-planner", "no-tools", "no-reflection"]
-    rows = [latest[k] for k in order if k in latest]
-    for k, v in latest.items():
-        if v not in rows:
-            rows.append(v)
+    rows = [latest[label] for label in order if label in latest]
+    for label, summary in latest.items():
+        if summary not in rows:
+            rows.append(summary)
 
     lines: list[str] = []
     lines.append("# Benchmark report\n")
     lines.append(f"Ablations ({len(rows)}), most recent per label.\n")
 
-    # Summary table
     lines.append("## Summary\n")
-    lines.append("| Label | Tasks | Overall score | Success rate | Tool-call hit | Mean latency | Runtime |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|")
-    for s in rows:
-        tcr = s.get("tool_call_success_rate")
+    lines.append("| Label | Tasks | Overall score | Success | Tool precision | Tool recall | Context utility | Reflection ROI | Mean latency |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for summary in rows:
         lines.append(
-            f"| `{s['label']}` "
-            f"| {s['task_count']} "
-            f"| {s['overall_score']:.3f} "
-            f"| {s['success_rate']:.1%} "
-            f"| {'n/a' if tcr is None else f'{tcr:.1%}'} "
-            f"| {s['mean_latency_ms']} ms "
-            f"| {s['total_runtime_s']}s |"
+            f"| `{summary['label']}` "
+            f"| {summary['task_count']} "
+            f"| {summary['overall_score']:.3f} "
+            f"| {summary['success_rate']:.1%} "
+            f"| {_fmt_rate(summary.get('tool_precision'))} "
+            f"| {_fmt_rate(summary.get('tool_recall'))} "
+            f"| {_fmt_rate(summary.get('context_utility_rate'))} "
+            f"| {_fmt_float(summary.get('reflection_roi'))} "
+            f"| {summary['mean_latency_ms']} ms |"
         )
 
-    # Ablation deltas vs full
     full = latest.get("full")
     if full:
         lines.append("\n## Ablation deltas (vs. `full`)\n")
         lines.append("| Label | Δ overall score | Δ success rate |")
         lines.append("|---|---:|---:|")
-        for s in rows:
-            if s["label"] == "full":
+        for summary in rows:
+            if summary["label"] == "full":
                 continue
-            dscore = s["overall_score"] - full["overall_score"]
-            drate = s["success_rate"] - full["success_rate"]
-            lines.append(f"| `{s['label']}` | {dscore:+.3f} | {drate:+.1%} |")
+            dscore = summary["overall_score"] - full["overall_score"]
+            drate = summary["success_rate"] - full["success_rate"]
+            lines.append(f"| `{summary['label']}` | {dscore:+.3f} | {drate:+.1%} |")
 
-    # Per-category breakdown for full
-    if full:
         lines.append("\n## Per-category scores (`full` run)\n")
         lines.append("| Category | n | Avg score |")
         lines.append("|---|---:|---:|")
         for cat, info in full.get("by_category", {}).items():
             lines.append(f"| {cat} | {info['n']} | {info['avg_score']:.3f} |")
 
-    # Flag grid
+        if full.get("by_slice"):
+            lines.append("\n## Slice scores (`full` run)\n")
+            lines.append("| Slice | n | Avg score |")
+            lines.append("|---|---:|---:|")
+            for slice_name, info in full.get("by_slice", {}).items():
+                lines.append(f"| {slice_name} | {info['n']} | {info['avg_score']:.3f} |")
+
     lines.append("\n## Flags per run\n")
-    lines.append("| Label | memory | planner | tools | reflection |")
-    lines.append("|---|:-:|:-:|:-:|:-:|")
-    for s in rows:
-        f = s.get("flags", {})
+    lines.append("| Label | memory | planner | tools | reflection | otel |")
+    lines.append("|---|:-:|:-:|:-:|:-:|:-:|")
+    for summary in rows:
+        flags = summary.get("flags", {})
         lines.append(
-            f"| `{s['label']}` "
-            f"| {'✅' if f.get('memory') else '❌'} "
-            f"| {'✅' if f.get('planner') else '❌'} "
-            f"| {'✅' if f.get('tools') else '❌'} "
-            f"| {'✅' if f.get('reflection') else '❌'} |"
+            f"| `{summary['label']}` "
+            f"| {'on' if flags.get('memory') else 'off'} "
+            f"| {'on' if flags.get('planner') else 'off'} "
+            f"| {'on' if flags.get('tools') else 'off'} "
+            f"| {'on' if flags.get('reflection') else 'off'} "
+            f"| {'on' if flags.get('otel') else 'off'} |"
         )
 
     lines.append("\n---")
     lines.append("\n_Generated by `python -m bench.report`._")
     return "\n".join(lines) + "\n"
+
+
+def _fmt_rate(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1%}"
+
+
+def _fmt_float(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f}"
 
 
 def main():

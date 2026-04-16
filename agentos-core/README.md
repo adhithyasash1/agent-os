@@ -2,9 +2,10 @@
 
 A **local-first orchestration and observability layer** for agentic workflows.
 
-agentos-core accepts a user request, retrieves relevant context, plans a next
-step, calls tools, verifies the result, and logs every step as a trace — all
-on one machine, in one process, using SQLite as the default store.
+agentos-core accepts a user request, retrieves tiered memory, packs context,
+plans a next step, calls tools, verifies the result, and logs every step as
+both a trace and an RL transition, all on one machine, in one process, using
+SQLite as the default store.
 
 It is not a general AGI. It is a small, honest runtime you can read in an
 afternoon, run without any API keys, and benchmark against ablations of
@@ -20,12 +21,12 @@ locally, and hard to prove anything about.
 
 agentos-core flips that:
 
-- **local by default** — SQLite only; no Neo4j / Chroma / Qdrant needed
-- **observable by default** — every phase of every run is a row in
-  `trace_events`
-- **testable by default** — a deterministic mock LLM runs the whole loop
+- **local by default**: SQLite only; no Neo4j / Chroma / Qdrant needed
+- **observable by default**: every phase of every run is a row in
+  `trace_events`, and every decision can also be captured in `rl_transitions`
+- **testable by default**: a deterministic mock LLM runs the whole loop
   without a network
-- **measurable by default** — one `python -m bench.runner --all-ablations`
+- **measurable by default**: one `python -m bench.runner --all-ablations`
   produces a report comparing full-system vs. each component off
 
 ---
@@ -41,12 +42,12 @@ understand  →  retrieve  →  plan  →  act  →  verify  →  (reflect & ret
 | Phase        | What happens                                              | Gated by           |
 |--------------|-----------------------------------------------------------|--------------------|
 | `understand` | Record the raw user input, validate non-empty             | always             |
-| `retrieve`   | FTS5 search over SQLite memory                            | `enable_memory`    |
-| `plan`       | LLM emits JSON `{action, tool, tool_args, answer}`        | `enable_planner`   |
+| `retrieve`   | Search `working`, `episodic`, and `semantic` memory, then rank and pack context | `enable_memory` |
+| `plan`       | LLM emits ReAct JSON `{goal, action, tool, tool_args, observation_summary, confidence, stop_reason, answer}` | `enable_planner` |
 | `act`        | Execute the chosen tool via the registry                  | `enable_tools`     |
-| `verify`     | Heuristic or expected-match scoring                       | always             |
+| `verify`     | Heuristic or expected-match scoring plus verifier metadata | always            |
 | `reflect`    | LLM critique → feed back into planner for next iteration  | `enable_reflection`|
-| `final`      | Persist answer + score; optionally write to memory        | always             |
+| `final`      | Persist answer + score, write RL tuples, and promote only verified facts into durable memory | always |
 
 Max iterations and the pass threshold are configurable.
 
@@ -60,9 +61,10 @@ agentos/
 ├── main.py               # FastAPI entrypoint + static UI mount
 ├── runtime/
 │   ├── loop.py           # The phase-by-phase agent loop
+│   ├── context_packer.py # Utility-ranked context budgeting
 │   ├── planner.py        # LLM JSON-decision planner
 │   └── trace.py          # SQLite TraceStore + TraceEvent
-├── memory/store.py       # SQLite FTS5 memory
+├── memory/store.py       # Tiered SQLite FTS5 memory
 ├── tools/
 │   ├── registry.py       # Tool protocol + flag-aware registry
 │   └── builtin.py        # calculator, http_fetch, tavily (optional)
@@ -76,6 +78,7 @@ agentos/
 │   └── reflection.py     # critique prompt
 └── api/routes.py         # /runs, /traces, /memory, /tools, /config, /health
 bench/                    # tasks + runner + report
+console/                  # Next.js App Router operator console
 tests/                    # pytest suite (uses MockLLM, no network)
 ui/index.html             # minimal single-file trace viewer
 ```
@@ -87,14 +90,18 @@ ui/index.html             # minimal single-file trace viewer
 | FastAPI API        | ✅   |          |                          |
 | SQLite TraceStore  | ✅   |          |                          |
 | SQLite MemoryStore | ✅   |          | `enable_memory`          |
+| Context packer     | ✅   |          | `context_char_budget`    |
 | Calculator tool    | ✅   |          | `enable_tools`           |
 | MockLLM            | ✅   |          | `llm_backend=mock`       |
 | Planner (LLM JSON) | ✅   |          | `enable_planner`         |
 | Scorer             | ✅   |          |                          |
+| RL transition log  | ✅   |          |                          |
 | Reflection         |      | ✅       | `enable_reflection`      |
 | HTTP fetch tool    |      | ✅       | `enable_http_fetch`      |
 | Ollama backend     |      | ✅       | `llm_backend=ollama`     |
 | Tavily search      |      | ✅       | `enable_tavily`          |
+| OpenTelemetry bridge |    | ✅       | `enable_otel`            |
+| Next.js console    |      | ✅       | `console/`               |
 | Static UI          |      | ✅       | (served if `ui/` exists) |
 
 ---
@@ -114,6 +121,20 @@ uvicorn agentos.main:app --reload
 
 Open <http://localhost:8000/> for the trace viewer, or
 <http://localhost:8000/docs> for the OpenAPI docs.
+
+### Optional Next.js console
+
+An operator-facing console also lives in `console/`. It uses Next.js App
+Router, TanStack Query, shadcn-style components, and Motion.
+
+```bash
+cd console
+npm install
+npm run dev
+```
+
+Point it at the API by copying `.env.local.example` to `.env.local` and
+setting `NEXT_PUBLIC_AGENTOS_API_BASE`.
 
 Try it:
 
@@ -151,17 +172,17 @@ pytest -q
 
 The suite covers:
 
-- **memory** — add/search/FTS correctness, meta roundtrip
-- **tools** — calculator, flag gating, unknown tool handling, unsafe input
-- **scorer** — expected-match, grounding bonus, refusal handling
-- **trace** — run lifecycle, event listing
-- **loop** — happy path, tool path, empty-input rejection, flag gating,
-  trace completeness
-- **api** — health, runs create/list/get, memory search, config patch,
-  empty input rejection
+- **memory**: tiered storage, salience filters, and verified promotion
+- **tools**: calculator, flag gating, unknown tool handling, unsafe input
+- **scorer**: expected-match, grounding bonus, and refusal handling
+- **trace**: run lifecycle, event listing, and RL transition persistence
+- **loop**: happy path, tool path, empty-input rejection, planner schema,
+  durable-memory gating, and trace completeness
+- **api**: health, runs create/list/get, memory search, config patch,
+  feedback writes, and empty input rejection
 
-All tests run against MockLLM and a temporary SQLite DB — no network, no
-model downloads.
+All tests run against MockLLM and a temporary SQLite DB with no network and
+no model downloads.
 
 ---
 
@@ -185,19 +206,27 @@ python -m bench.report
 
 `bench/tasks.json` ships a small, balanced set:
 
-- `knowledge` — direct factual questions
-- `tool_use` — must invoke the calculator
-- `reasoning` — small arithmetic / logic puzzles
-- `failure_handling` — empty input, nonsense, fabrication baiting
+- `knowledge`: direct factual questions
+- `tool_use`: must invoke the calculator
+- `reasoning`: small arithmetic / logic puzzles
+- `retrieval`: questions that require seeded memory
+- `failure_handling`: empty input, nonsense, fabrication baiting
+
+Tasks are also tagged by slice so you can track retrieval-required,
+tool-required, multi-step, long-context, refusal-safety, and reflection-roi
+behavior independently.
 
 ### Metrics tracked per run
 
-- `overall_score` — mean of per-task scores (expected-match or heuristic)
-- `success_rate` — fraction scoring ≥ 0.6
-- `tool_call_success_rate` — of tasks with `expected_tool`, how many called it
-- `mean_latency_ms` — wall-clock per task
-- `by_category` — score per category
-- `flags` — feature flags used for this run
+- `overall_score`: mean of per-task scores
+- `success_rate`: fraction scoring ≥ 0.6
+- `tool_call_success_rate`: of tasks with `expected_tool`, how many called it
+- `tool_precision` / `tool_recall`: whether tool usage is both correct and complete
+- `context_utility_rate`: whether retrieved context actually improved solved retrieval tasks
+- `reflection_roi`: score delta when reflection fired
+- `mean_latency_ms`: wall-clock per task
+- `by_category` and `by_slice`: score breakdowns
+- `flags`: feature flags used for this run
 
 ### Ablations
 
@@ -230,7 +259,17 @@ Returns the run row plus ordered `trace_events`, each carrying:
 - `latency_ms`, `tokens_in`, `tokens_out` (best-effort)
 - `error` — populated if the step failed
 
-The static UI at `/` renders runs and their traces directly from these rows.
+Each run also includes ordered `rl_transitions` with `(state, action,
+observation, reward)` tuples, plus metadata such as `prompt_version`,
+`context_ids`, `retrieval_candidates`, `tool_latency_ms`, `verifier_score`,
+`reflection_delta`, and optional `user_feedback`.
+
+When `AGENTOS_ENABLE_OTEL=true`, the trace store also dual-writes spans
+through an optional OpenTelemetry bridge so the same run can be viewed in a
+tracing backend such as Phoenix.
+
+The static UI at `/` renders runs and their traces directly from these rows,
+and the Next.js console gives you a richer operator workflow.
 
 ---
 
@@ -255,8 +294,9 @@ The static UI at `/` renders runs and their traces directly from these rows.
 - **MockLLM is not an LLM.** It is a stub so the loop is runnable and
   testable without a model. Non-trivial reasoning requires Ollama or a
   hosted backend.
-- **Memory is keyword-only.** FTS5 beats LIKE but is not semantic. Adding
-  embeddings is straightforward but intentionally deferred.
+- **Memory is still keyword-first.** The runtime now distinguishes working,
+  episodic, and semantic tiers, but retrieval is still FTS5 rather than
+  embedding-based search.
 - **Tools are minimal.** Calculator + HTTP fetch + optional Tavily. The
   registry is designed so adding tools is ~20 lines, not a refactor.
 - **No multi-agent orchestration.** One loop, one agent. Multi-agent is not
@@ -276,12 +316,21 @@ important ones:
 | `AGENTOS_PROFILE`           | minimal  | `minimal` or `full`                |
 | `AGENTOS_LLM_BACKEND`       | mock     | `mock` or `ollama`                 |
 | `AGENTOS_DB_PATH`           | `./data/agentos.db` | SQLite file            |
+| `AGENTOS_PROMPT_VERSION`    | `react-context-v1` | prompt/schema version    |
 | `AGENTOS_MAX_STEPS`         | 4        | max planner/executor iterations    |
 | `AGENTOS_EVAL_PASS_THRESHOLD` | 0.6    | score threshold for completion     |
+| `AGENTOS_CONTEXT_CHAR_BUDGET` | 8000   | total context packer budget        |
+| `AGENTOS_MEMORY_SEARCH_K`   | 8        | retrieved memories per query       |
+| `AGENTOS_MEMORY_MIN_SALIENCE` | 0.15   | drop weak memories before packing  |
+| `AGENTOS_WORKING_MEMORY_TTL_SECONDS` | 3600 | short-lived scratch memory   |
+| `AGENTOS_EPISODIC_MEMORY_TTL_SECONDS` | 1209600 | durable run memory     |
 | `AGENTOS_ENABLE_MEMORY`     | true     |                                    |
 | `AGENTOS_ENABLE_PLANNER`    | true     |                                    |
 | `AGENTOS_ENABLE_TOOLS`      | true     |                                    |
 | `AGENTOS_ENABLE_REFLECTION` | true     |                                    |
+| `AGENTOS_ENABLE_OTEL`       | false    | dual-write traces to OTel          |
+| `AGENTOS_OTEL_SERVICE_NAME` | `agentos-core` | span service name             |
+| `AGENTOS_OTEL_EXPORTER_OTLP_ENDPOINT` | empty | optional OTLP endpoint     |
 
 ---
 
