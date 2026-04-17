@@ -4,7 +4,13 @@ from ..core import tool
 @tool(
     name="http_fetch",
     description="Fetch the body of an HTTP(S) URL (bounded to 50KB).",
-    args_schema={"url": "string, http(s) URL"},
+    args_schema={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "http(s) URL"}
+        },
+        "required": ["url"]
+    },
     profiles=["full"]
 )
 async def _http_fetch(args: dict, ctx: dict) -> dict:

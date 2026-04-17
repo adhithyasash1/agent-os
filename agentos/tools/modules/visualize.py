@@ -7,9 +7,13 @@ from ..core import tool
     name="render_page",
     description="Generate a rich Apache ECharts HTML visualization file from raw data metrics.",
     args_schema={
-        "chart_type": "string, e.g. line, bar, pie, radar",
-        "title": "string, Title of the chart",
-        "data": "JSON array of data points"
+        "type": "object",
+        "properties": {
+            "chart_type": {"type": "string", "description": "e.g. line, bar, pie, radar"},
+            "title": {"type": "string", "description": "Title of the chart"},
+            "data": {"type": "array", "description": "array of data points"}
+        },
+        "required": ["chart_type", "title", "data"]
     },
     profiles=["full"]
 )

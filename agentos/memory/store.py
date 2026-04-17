@@ -29,11 +29,14 @@ from .salience import (
 )
 
 
-MEMORY_KINDS = ("working", "episodic", "semantic")
+MEMORY_KINDS = ("working", "episodic", "semantic", "experience", "style", "failure")
 DEFAULT_TTLS = {
     "working": 60 * 60,
     "episodic": 60 * 60 * 24 * 14,
     "semantic": None,
+    "experience": None,
+    "style": None,
+    "failure": 60 * 60 * 24 * 30, # Failures decay after a month
 }
 
 
@@ -275,6 +278,64 @@ class MemoryStore:
             meta={"source_question": user_input},
         )
         return {"episodic_id": episodic_id, "semantic_id": semantic_id}
+
+    def record_experience(
+        self,
+        *,
+        user_input: str,
+        plan: list[str],
+        tool_calls: list[str],
+        answer: str,
+        run_id: str,
+        verifier_score: float,
+    ) -> int:
+        record = {
+            "prompt": user_input,
+            "task_type": "demonstration",
+            "plan": plan,
+            "tool_calls": tool_calls,
+            "final_answer": answer,
+            "judge_score": verifier_score,
+            "success_reason": "Verified completion",
+        }
+        text = f"Successful Trajectory\nPrompt: {user_input}\nTools: {tool_calls}\nResult: {answer}"
+        return self.add(
+            text,
+            kind="experience",
+            salience=max(PROMOTED_FACT_SALIENCE_FLOOR, verifier_score),
+            ttl_seconds=None,
+            source_run_id=run_id,
+            verifier_score=verifier_score,
+            meta=record,
+        )
+
+    def record_failure(
+        self,
+        *,
+        user_input: str,
+        plan: list[str],
+        tool_calls: list[str],
+        error_or_answer: str,
+        run_id: str,
+        score: float,
+    ) -> int:
+        record = {
+            "prompt": user_input,
+            "plan": plan,
+            "tool_calls": tool_calls,
+            "error": error_or_answer,
+            "judge_score": score,
+        }
+        text = f"Failure Avoidance\nPrompt: {user_input}\nDead-end: {error_or_answer}"
+        return self.add(
+            text,
+            kind="failure",
+            salience=0.3, # Low salience for failures, unless it heavily matches lexically
+            ttl_seconds=None,
+            source_run_id=run_id,
+            verifier_score=score,
+            meta=record,
+        )
 
     def search(
         self,

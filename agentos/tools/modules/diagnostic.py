@@ -8,7 +8,7 @@ _START_TIME = time.time()
 @tool(
     name="system_diagnostic",
     description="Retrieve live diagnostic telemetry for the local host and agent runtime. Includes memory, CPU, and uptime.",
-    args_schema={},
+    args_schema={"type": "object", "properties": {}},
     profiles=["full"]
 )
 async def _diagnostic(args: dict, ctx: dict) -> dict:

@@ -1,16 +1,10 @@
 # agentos-core
 
-A **local-first orchestration and observability layer** for agentic workflows.
+A local-first agent orchestration runtime. 
 
-agentos-core accepts a user request, retrieves tiered memory, packs context,
-plans a next step, calls tools, verifies the result, and logs every step as
-both a `trace_event` and a **structured run log with score annotation**
-(stored in the `run_transitions` table). All on one machine, in one process, using
-SQLite as the default store.
+agentos-core accepts a user request, retrieves matching context from 6 typed memory stores, packs the context, plans a next step, executes safely bordered tools, verifies the result, and records the flow. Everything happens on-machine using SQLite.
 
-It is not a general AGI. It is a small, honest runtime you can read in an
-afternoon, run as an offline demo without any API keys, and upgrade to a
-real LLM the moment you want real signal.
+It is designed to be fully testable without external APIs. It prioritizes structure and logging robustness over black-box AI magic.
 
 ---
 
@@ -53,18 +47,22 @@ understand  →  retrieve  →  plan  →  act  →  verify  →  (reflect & ret
 
 Max iterations and the pass threshold are configurable.
 
+### Memory Architecture
+
+The system utilizes 6 specialized memory stores implemented inside SQLite:
+
+- `working`: Short-lived scratchpad for multi-turn conversational context. Decays rapidly.
+- `episodic`: Long-term fact persistence. Written only conditionally upon verified execution.
+- `semantic`: Deep domain rules or generalized abstractions.
+- `experience`: Top-performing trajectories (planner logic and tools). Injected as dynamic Few-Shot examples into future prompts.
+- `failure`: Recorded dead-ends from error recoveries, allowing the agent to avoid repeating exact mistakes. Kept at a carefully weighted lower-salience unless explicitly matched.
+- `style`: End-user interaction requirements.
+
 ### What "trustworthy" means for memory promotion
 
-The loop only writes to durable (`episodic` / `semantic`) memory when the
-verification step returns `trustworthy=true`. Today that means one of:
+The loop only promotes data to long-standing memory (`experience`, `episodic`, `semantic`) when the verification step scores `trustworthy=true`.
 
-- an `expected_contains` match (benchmark-time, not live); or
-- an LLM-as-judge score where both `correct ≥ 0.7` and `grounded ≥ 0.5`.
-
-The heuristic scorer (grounding overlap + refusal detection) is a **weak
-signal** and is never a standalone promotion gate. This is a deliberate
-change from earlier versions, which would happily promote fabricated
-answers that simply echoed context keywords.
+For trajectories to enter `experience` memory, they must pass strict scoring thresholds, converting the JSON tool calls and the outcome goal into structured few-shot lessons. The heuristic scorer is weak—meaning only explicit `expected_contains` benchmark matches or LLM-as-Judge loops will permanently promote an experience.
 
 ---
 
@@ -333,18 +331,12 @@ fields; prefer the console for day-to-day use.
 
 ## Reliability
 
-- Planner output is parsed with a tolerant regex + JSON fallback — if
-  the LLM ignores the schema, the raw text is treated as the final answer.
-- Ollama backend retries with exponential backoff (120s+ timeout for
-  cloud models).
-- Tools wrap every call in try/except and return a uniform
-  `{status, output, error}` dict.
+- **Strict Tooling**: Tool arguments strictly abide by declared JSON Schemas. Malformed LLM parameters are blocked at the registry layer with localized error returns, forcing self-correction before arbitrary execution.
+- **Sandboxed Workspace**: Any local file traversal occurs inside the heavily restricted `workspace_manager` tool, which intercepts and sanitizes local path manipulation.
+- Planner output is parsed with a tolerant regex + JSON fallback — if the LLM ignores the schema, the raw text is treated as the final answer.
+- Ollama backend retries with exponential backoff.
 - Empty or whitespace-only input is rejected before the loop runs.
-- `memory.add(ttl_seconds=0)` now raises `ValueError` instead of
-  silently writing a row that expires immediately.
-- `/config` patches build a fresh components bundle from the new
-  settings and swap `app.state.components` atomically under a lock, so
-  in-flight requests keep consistent settings. Patches are scoped to the
+- `/config` patches build a fresh components bundle from the new settings and swap `app.state.components` atomically.
   routing flags (`enable_memory`, `enable_planner`, `enable_tools`,
   `enable_reflection`, `enable_llm_judge`, `enable_otel`); the LLM
   instance, memory store, and DB path are **not** swapped live — flip

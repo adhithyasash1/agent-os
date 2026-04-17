@@ -648,6 +648,23 @@ class _AgentRun:
                 salience=max(PROMOTED_FACT_SALIENCE_FLOOR, self.score),
                 episodic_ttl_seconds=self.cfg.episodic_memory_ttl_seconds,
             )
+            self.memory.record_experience(
+                user_input=self.user_input,
+                plan=[p.goal for p in self.prior_decisions if getattr(p, "goal", None)],
+                tool_calls=[t["tool"] for t in self.tool_results],
+                answer=self.answer,
+                run_id=self.run_id,
+                verifier_score=self.score,
+            )
+        elif self.score < self.cfg.eval_pass_threshold:
+            self.memory.record_failure(
+                user_input=self.user_input,
+                plan=[p.goal for p in self.prior_decisions if getattr(p, "goal", None)],
+                tool_calls=[t["tool"] for t in self.tool_results],
+                error_or_answer=self.answer or "Exhausted retries without verified answer",
+                run_id=self.run_id,
+                score=self.score,
+            )
 
     # ------------------------------------------------------------------
     # Phase: finalize (ok / error)

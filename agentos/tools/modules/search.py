@@ -4,7 +4,13 @@ from ..core import tool
 @tool(
     name="tavily_search",
     description="Web search via Tavily API.",
-    args_schema={"query": "string, search query"},
+    args_schema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "search query"}
+        },
+        "required": ["query"]
+    },
     profiles=["full"]
 )
 async def _tavily_search(args: dict, ctx: dict) -> dict:

@@ -181,6 +181,30 @@
       "expected_behavior": "detect_fabrication",
       "difficulty": "hard",
       "slices": ["refusal-safety"]
+    },
+    {
+      "id": "exp-01",
+      "category": "retrieval",
+      "prompt": "Write a python script that prints Hello World exactly the way I did it before.",
+      "expected_contains": ["print('Hello World')"],
+      "difficulty": "medium",
+      "slices": ["retrieval-required"],
+      "setup_memory": [
+        {
+          "kind": "experience",
+          "salience": 0.9,
+          "text": "Successful Trajectory\\nPrompt: Write a python script that prints Hello World exactly the way I did it before.\\nTools: [write_file]\\nResult: Wrote print('Hello World') target script successfully."
+        }
+      ]
+    },
+    {
+      "id": "tool-04",
+      "category": "tool_use",
+      "prompt": "Read the contents of notes.txt in the workspace.",
+      "expected_tool": "read_file",
+      "expected_contains": ["Access denied", "not found", "error"],
+      "difficulty": "medium",
+      "slices": ["failure-recovery"]
     }
   ]
 }

@@ -4,8 +4,12 @@ from ..core import tool
     name="search_memory",
     description="Search the agent's persistent long-term semantic memory for concepts, facts, or instructions.",
     args_schema={
-        "query": "string, the search term",
-        "k": "integer, optional number of results to fetch"
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "the search term"},
+            "k": {"type": "integer", "description": "optional number of results to fetch"}
+        },
+        "required": ["query"]
     },
     profiles=["full"]
 )

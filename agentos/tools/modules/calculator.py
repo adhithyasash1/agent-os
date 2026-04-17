@@ -24,7 +24,13 @@ def _safe_eval(expr: str) -> float:
 @tool(
     name="calculator",
     description="Evaluate an arithmetic expression (+, -, *, /, %, //, **).",
-    args_schema={"expression": "string, e.g. '2 + 2 * 3'"},
+    args_schema={
+        "type": "object",
+        "properties": {
+            "expression": {"type": "string", "description": "e.g. '2 + 2 * 3'"}
+        },
+        "required": ["expression"]
+    },
     profiles=["minimal", "full"]
 )
 async def _calculator(args: dict, ctx: dict) -> dict:

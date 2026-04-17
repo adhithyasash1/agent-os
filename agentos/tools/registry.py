@@ -60,6 +60,43 @@ class ToolRegistry:
                 del self._disabled_until[name]
                 self._failures[name] = 0
 
+        # Boundary schema validation (custom lightweight JSON validator)
+        if tool.args_schema.get("type") == "object":
+            required = tool.args_schema.get("required", [])
+            properties = tool.args_schema.get("properties", {})
+            provided_args = args or {}
+            
+            # Check for missing required parameters
+            missing = [r for r in required if r not in provided_args]
+            if missing:
+                self._failures[name] += 1
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": f"Invalid tool arguments: Missing required parameters: {missing}"
+                }
+            
+            # Check for invalid extra parameters
+            extra = [k for k in provided_args if k not in properties and not tool.args_schema.get("additionalProperties", False)]
+            if extra and name not in ("__dynamic__", "mcp"): 
+                self._failures[name] += 1
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": f"Invalid tool arguments: Unknown parameters provided: {extra}. Only {list(properties.keys())} are allowed."
+                }
+            
+            # Very lightweight type checking (string, integer, boolean, array)
+            for k, v in provided_args.items():
+                if k in properties:
+                    expected_type = properties[k].get("type")
+                    if expected_type == "string" and not isinstance(v, str):
+                        return {"status": "error", "error": f"Argument '{k}' must be a string."}
+                    if expected_type in ("integer", "number") and not isinstance(v, (int, float)):
+                        return {"status": "error", "error": f"Argument '{k}' must be a number."}
+                    if expected_type == "array" and not isinstance(v, list):
+                        return {"status": "error", "error": f"Argument '{k}' must be an array."}
+
         # Execute Tool
         result = await tool.fn(args or {}, context or {})
         

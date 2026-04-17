@@ -98,8 +98,11 @@ def pack_context(
         meta={"stable": True},
     )
 
-    memory_chunks = [
-        ContextChunk(
+    memory_chunks = []
+    experience_chunks = []
+    
+    for hit in memory_hits:
+        chunk = ContextChunk(
             chunk_id=f"memory:{hit['id']}",
             section="retrieved_memory",
             text=_memory_chunk_text(hit),
@@ -110,8 +113,11 @@ def pack_context(
                 "source_run_id": hit.get("source_run_id"),
             },
         )
-        for hit in memory_hits
-    ]
+        if hit.get("kind") == "experience":
+            chunk.section = "past_successful_examples"
+            experience_chunks.append(chunk)
+        else:
+            memory_chunks.append(chunk)
 
     tool_chunks = []
     for item in tool_results[-6:]:
@@ -135,10 +141,16 @@ def pack_context(
     )
 
     chosen_memory = _fit_chunks(memory_chunks, memory_budget)
+    
+    # Conditionally inject 0, 1, or 2 examples based on utility
+    available_exp_budget = memory_budget - sum(len(c.text) for c in chosen_memory)
+    # Give it explicit priority room if lexical utility is very high
+    chosen_experience = _fit_chunks(experience_chunks, max(available_exp_budget, 1000))[:2]
+    
     chosen_tools = _fit_chunks(tool_chunks, tool_budget)
     chosen_scratchpad = [scratchpad_chunk] if scratchpad_text else []
 
-    included = [developer_chunk, *chosen_memory, *chosen_tools, *chosen_scratchpad]
+    included = [developer_chunk, *chosen_experience, *chosen_memory, *chosen_tools, *chosen_scratchpad]
     rendered = _render_context(included)
     grounding = _render_context([*chosen_memory, *chosen_tools, *chosen_scratchpad])
 

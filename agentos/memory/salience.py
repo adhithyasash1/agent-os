@@ -59,5 +59,8 @@ KIND_BONUS = {
     "working": 0.16,
     "episodic": 0.26,
     "semantic": 0.36,
+    "style": 0.38,
+    "experience": 0.40,
+    "failure": 0.05,
 }
 KIND_BONUS_DEFAULT = 0.1
