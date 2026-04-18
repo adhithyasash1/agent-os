@@ -111,6 +111,12 @@ def test_settings_budget_validation():
         ).apply_profile()
 
 
+def test_settings_max_steps_default_matches_docs():
+    from agentos.config import Settings
+
+    assert Settings.model_fields["max_steps"].default == 4
+
+
 def test_feedback_endpoint(client):
     run = client.post("/api/v1/runs", json={"input": "What is the capital of France?"}).json()
     r = client.post(

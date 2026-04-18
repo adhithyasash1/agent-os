@@ -1,3 +1,5 @@
+import asyncio
+
 from ..core import tool
 
 @tool(
@@ -27,11 +29,11 @@ async def _search_memory(args: dict, ctx: dict) -> dict:
         
         # 1. Knowledge Graph Neighborhood
         if entity_id:
-            results["graph"] = memory_store.graph_search(entity_id)
+            results["graph"] = await asyncio.to_thread(memory_store.graph_search, entity_id)
             
         # 2. Semantic Search
         if query:
-            search_hits = memory_store.search(query, k=k)
+            search_hits = await asyncio.to_thread(memory_store.search, query, k)
             results["semantic"] = [
                 {
                     "content": hit["text"],
@@ -101,7 +103,8 @@ async def _save_knowledge(args: dict, ctx: dict) -> dict:
         # 1. Save Entities
         name_to_id = {}
         for ent in entities_data:
-            eid = memory_store.upsert_entity(
+            eid = await asyncio.to_thread(
+                memory_store.upsert_entity,
                 name=ent["name"],
                 entity_type=ent.get("type"),
                 description=ent.get("description")
@@ -112,15 +115,21 @@ async def _save_knowledge(args: dict, ctx: dict) -> dict:
         # 2. Save Relations
         for rel in relations_data:
             # Ensure entities exist first (auto-creation of missing nodes)
-            sub_id = name_to_id.get(rel["subject"].lower()) or memory_store.upsert_entity(name=rel["subject"])
-            obj_id = name_to_id.get(rel["object"].lower()) or memory_store.upsert_entity(name=rel["object"])
+            sub_id = name_to_id.get(rel["subject"].lower()) or await asyncio.to_thread(
+                memory_store.upsert_entity,
+                name=rel["subject"],
+            )
+            obj_id = name_to_id.get(rel["object"].lower()) or await asyncio.to_thread(
+                memory_store.upsert_entity,
+                name=rel["object"],
+            )
             
-            memory_store.add_relation(sub_id, rel["predicate"], obj_id)
+            await asyncio.to_thread(memory_store.add_relation, sub_id, rel["predicate"], obj_id)
             summary["relations_linked"] += 1
             
         # 3. Save Plain Facts
         for fact in facts:
-            memory_store.add(fact, kind="semantic", salience=0.8)
+            await asyncio.to_thread(memory_store.add, fact, kind="semantic", salience=0.8)
             summary["facts_indexed"] += 1
             
         return {"status": "ok", "output": summary}

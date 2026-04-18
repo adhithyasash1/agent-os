@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     semantic_min_score: float = 0.50
 
     # Agent loop
-    max_steps: int = 25
+    max_steps: int = 4
     eval_pass_threshold: float = 0.6
     context_char_budget: int = 32000  # Default safe floor (32k chars / ~8k tokens)
     memory_search_k: int = 8
