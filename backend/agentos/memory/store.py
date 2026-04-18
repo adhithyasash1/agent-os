@@ -459,7 +459,9 @@ class MemoryStore:
         salience: float = 0.8,
         episodic_ttl_seconds: int | None = None,
         semantic_ttl_seconds: int | None = None,
+        meta: dict | None = None,
     ) -> dict[str, int]:
+        promote_meta = meta or {}
         episodic_id = self.add(
             f"Episode\nUser: {user_input}\nVerified answer: {answer}",
             kind="episodic",
@@ -468,7 +470,7 @@ class MemoryStore:
             source_run_id=run_id,
             tool_used=tool_used,
             verifier_score=verifier_score,
-            meta={"user_input": user_input, "answer": answer},
+            meta={**promote_meta, "user_input": user_input, "answer": answer},
         )
         semantic_id = self.add(
             answer[:1200],
@@ -478,7 +480,7 @@ class MemoryStore:
             source_run_id=run_id,
             tool_used=tool_used,
             verifier_score=verifier_score,
-            meta={"source_question": user_input},
+            meta={**promote_meta, "source_question": user_input},
         )
         return {"episodic_id": episodic_id, "semantic_id": semantic_id}
 
