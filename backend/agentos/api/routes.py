@@ -12,7 +12,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from fastapi.concurrency import asynccontextmanager
 from pydantic import BaseModel, Field, field_validator
 import re
@@ -143,6 +143,46 @@ async def create_run(req: RunRequest, c: Components = Depends(get_components)):
         "verification": result.verification,
         "initial_score": result.initial_score,
     }
+
+
+@api_router.post("/runs/async")
+async def create_run_async(
+    req: RunRequest,
+    background_tasks: BackgroundTasks,
+    c: Components = Depends(get_components),
+):
+    """Start a run in the background and return the ID immediately.
+
+    The client can then poll /runs/{run_id} to get live updates from the
+    TraceStore (thoughts, tool calls, status, etc.).
+    """
+    run_id = c.traces.start_run(
+        req.input,
+        c.settings.profile,
+        c.settings.describe()["flags"],
+        prompt_version=c.settings.prompt_version,
+    )
+
+    background_tasks.add_task(_run_agent_background_task, req.input, c, run_id)
+
+    return {"run_id": run_id, "status": "running"}
+
+
+async def _run_agent_background_task(user_input: str, c: Components, run_id: str):
+    async with _run_semaphore:
+        try:
+            await run_agent(
+                user_input,
+                llm=c.llm,
+                tools=c.tools,
+                memory=c.memory,
+                traces=c.traces,
+                config=c.settings,
+                run_id=run_id,
+            )
+        except Exception as e:
+            # If a background run crashes, ensure the run is marked as failed.
+            c.traces.finish_run(run_id, "", 0.0, 0, 0, status="error")
 
 
 @api_router.get("/runs")

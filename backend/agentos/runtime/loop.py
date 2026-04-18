@@ -69,6 +69,7 @@ async def run_agent(
     traces: TraceStore,
     config: Settings | None = None,
     expected: dict | None = None,
+    run_id: str | None = None,
 ) -> AgentResult:
     run = _AgentRun(
         user_input=user_input,
@@ -78,6 +79,7 @@ async def run_agent(
         traces=traces,
         cfg=config or default_settings,
         expected=expected,
+        run_id=run_id,
     )
     return await run.run()
 
@@ -101,6 +103,7 @@ class _AgentRun:
         traces: TraceStore,
         cfg: Settings,
         expected: dict | None,
+        run_id: str | None = None,
     ) -> None:
         self.user_input = user_input
         self.llm = llm
@@ -110,12 +113,15 @@ class _AgentRun:
         self.cfg = cfg.model_copy(deep=True)
         self.expected = expected
 
-        self.run_id = traces.start_run(
-            user_input,
-            cfg.profile,
-            cfg.describe()["flags"],
-            prompt_version=cfg.prompt_version,
-        )
+        if run_id:
+            self.run_id = run_id
+        else:
+            self.run_id = traces.start_run(
+                user_input,
+                cfg.profile,
+                cfg.describe()["flags"],
+                prompt_version=cfg.prompt_version,
+            )
 
         self._step = 0
         self._transition_step = 0

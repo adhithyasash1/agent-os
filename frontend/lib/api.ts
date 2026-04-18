@@ -41,6 +41,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ input })
     }),
+  createRunAsync: (input: string) =>
+    apiFetch<{ run_id: string; status: "running" }>("/runs/async", {
+      method: "POST",
+      body: JSON.stringify({ input })
+    }),
   leaveFeedback: (runId: string, payload: { rating?: number; notes?: string }) =>
     apiFetch<{ run_id: string; feedback: { rating?: number; notes?: string } }>(
       `/runs/${runId}/feedback`,

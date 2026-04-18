@@ -42,7 +42,7 @@ export default function ChatPage() {
   });
 
   const dispatchMutation = useMutation({
-    mutationFn: (text: string) => api.createRun(text),
+    mutationFn: (text: string) => api.createRunAsync(text),
     onSuccess: (res) => {
       setCurrentRunId(res.run_id);
     },
@@ -218,16 +218,22 @@ function AgentMessage({ run }: { run: any }) {
 }
 
 function ThinkingIndicator({ run }: { run: any }) {
-  const lastEvent = run.events?.[run.events.length - 1];
-  const phase = lastEvent?.kind || "understanding";
+  const lastTransition = run.transitions?.[run.transitions.length - 1];
+  const stage = lastTransition?.stage || "starting";
+  const action = lastTransition?.action || {};
+  
+  // Extract specific details for better "streaming" feel
+  const currentGoal = action.goal || "Initializing research context...";
+  const toolName = action.tool;
+  const isTool = stage === "tool_result" || (stage === "plan" && action.type === "call_tool");
 
   const phases = [
-    { label: "Understand", icon: Brain },
-    { label: "Retrieve", icon: History },
-    { label: "Plan", icon: Sparkles },
-    { label: "Act", icon: Terminal },
-    { label: "Verify", icon: History },
-    { label: "Final", icon: Bot },
+    { label: "Understand", match: "understand" },
+    { label: "Retrieve", match: "memory" },
+    { label: "Plan", match: "plan" },
+    { label: "Act", match: "tool" },
+    { label: "Verify", match: "verify" },
+    { label: "Final", match: "final" },
   ];
 
   return (
@@ -235,21 +241,32 @@ function ThinkingIndicator({ run }: { run: any }) {
       <div className="w-8 h-8 bg-accent/10 rounded-lg flex items-center justify-center flex-shrink-0">
         <Cpu className="w-5 h-5 text-accent animate-pulse" />
       </div>
-      <div className="space-y-3 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] font-bold uppercase text-accent tracking-tighter animate-pulse">
-            {phase}...
-          </span>
+      <div className="space-y-4 flex-1">
+        <div className="space-y-1">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-bold uppercase text-accent tracking-tighter animate-pulse uppercase">
+              {stage.replace("_", " ")}
+            </span>
+            {isTool && toolName && (
+              <span className="text-[10px] font-mono text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded border border-emerald-400/20">
+                TOOL: {toolName}
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-muted leading-relaxed italic border-l-2 border-accent/20 pl-4 py-1">
+            {currentGoal}
+          </p>
         </div>
+        
         <div className="flex gap-1">
           {phases.map((p) => {
-            const isCurrent = p.label.toLowerCase() === phase;
+            const isActive = stage.includes(p.match);
             return (
               <div 
                 key={p.label} 
                 className={cn(
-                  "h-1 flex-1 rounded-full bg-white/5 transition-all duration-1000",
-                  isCurrent ? "bg-accent shadow-[0_0_8px_rgba(125,211,252,0.5)]" : ""
+                  "h-1 flex-1 rounded-full bg-white/5 transition-all duration-500",
+                  isActive ? "bg-accent shadow-[0_0_8px_rgba(125,211,252,0.5)]" : ""
                 )} 
               />
             );

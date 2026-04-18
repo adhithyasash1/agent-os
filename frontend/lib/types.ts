@@ -115,6 +115,11 @@ export type CreateRunResponse = RunSummary & {
   };
 };
 
+export type AsyncRunResponse = {
+  run_id: string;
+  status: "running";
+};
+
 export type MemorySearchResult = {
   id: number;
   kind: string;
