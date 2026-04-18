@@ -17,6 +17,7 @@ in `run()` and the helpers below it.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -146,7 +147,7 @@ class _AgentRun:
         self.current_pack: PackedContext | None = None
         
         # Best Answer Tracking (Plan V7)
-        self.best_answer = ""
+        self.best_answer: str | None = None
         self.best_score = 0.0
         
         # New state for Plan V6 hardening
@@ -158,24 +159,23 @@ class _AgentRun:
     # ------------------------------------------------------------------
     async def run(self) -> AgentResult:
         if self.cfg.enable_memory:
-            self.memory.cleanup_expired(exclude_run_id=self.run_id)
+            await self._run_memory_io(
+                self.memory.cleanup_expired,
+                exclude_run_id=self.run_id,
+            )
 
         if not self.user_input or not self.user_input.strip():
             return self._finalize_rejected()
 
         try:
-            self._stash_user_input()
+            await self._stash_user_input()
             self._emit_understand()
-            self._retrieve()
+            await self._retrieve()
             self.current_pack = self._pack()
 
-            # The loop runs for max_steps (default 10) + 1 potential Overtime Step (Step 11).
-            max_total = self.cfg.max_steps + 1
-            for iteration in range(max_total):
-                # Ensure termination: Step 11 is always the final chance.
-                if iteration == self.cfg.max_steps:
+            for iteration in range(self.cfg.max_steps):
+                if iteration == self.cfg.max_steps - 1:
                     self.can_retry = False
-
                 self.current_pack = self._pack()
                 decision = await self._plan(iteration)
                 
@@ -195,6 +195,7 @@ class _AgentRun:
                     break
 
                 # Reflection & Soft Reset
+                self.reflection_baseline = self.score
                 await self._reflect()
                 
                 # Double-Dip Trajectory Check: Noise-resilient termination on quality death spirals.
@@ -220,20 +221,21 @@ class _AgentRun:
                 self.answer = ""
                 self.score = 0.0
             
-            # Determine if we exited via natural early-exit or by hitting the step limit.
-            # iteration is 0-indexed. max_steps is default 10.
-            # If iteration >= 9, we are at or past the normal limit.
             reached_limit = iteration >= self.cfg.max_steps - 1
-            status = "timeout_synthesis" if (reached_limit and self.answer != "") else "ok"
+            status = (
+                "timeout_synthesis"
+                if (reached_limit and self.score < self.cfg.eval_pass_threshold and self.answer != "")
+                else "ok"
+            )
             
             # Finalization: Return the best-scoring answer found across all attempts.
             # This prevents serving a degraded retry (e.g. 0.7 -> 0.4 abort).
-            if self.best_answer:
+            if self.best_answer is not None:
                 self.answer = self.best_answer
                 self.score = self.best_score
 
             # Post-Synthesis promotion: save final comparison/insights to Graph.
-            self._promote_if_trustworthy(status=status)
+            await self._promote_if_trustworthy(status=status)
 
             final_pack = self._pack()
             return self._finalize_ok(final_pack, status=status)
@@ -251,6 +253,9 @@ class _AgentRun:
     def _next_transition(self) -> int:
         self._transition_step += 1
         return self._transition_step
+
+    async def _run_memory_io(self, fn, /, *args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
     def _pack(self) -> PackedContext:
         unique_results: dict[tuple[Any, str], dict] = {}
@@ -343,10 +348,11 @@ class _AgentRun:
     # ------------------------------------------------------------------
     # Phase: understand / retrieve
     # ------------------------------------------------------------------
-    def _stash_user_input(self) -> None:
+    async def _stash_user_input(self) -> None:
         if not self.cfg.enable_memory:
             return
-        self.memory.add(
+        await self._run_memory_io(
+            self.memory.add,
             f"User request: {self.user_input}",
             kind="working",
             salience=USER_INPUT_SALIENCE,
@@ -367,11 +373,12 @@ class _AgentRun:
             )
         )
 
-    def _retrieve(self) -> None:
+    async def _retrieve(self) -> None:
         if not self.cfg.enable_memory:
             return
         with Timer() as t:
-            self.memory_hits = self.memory.search(
+            self.memory_hits = await self._run_memory_io(
+                self.memory.search,
                 self.user_input,
                 k=self.cfg.memory_search_k,
                 min_salience=self.cfg.memory_min_salience,
@@ -416,17 +423,20 @@ class _AgentRun:
         # Phase: Conditional Advisories (Plan V6)
         force_critique = self.critique
         
-        # Advisory Logic: Correction Required (Step 10, if retrying)
-        if iteration == 9 and self.can_retry and len(self.failed_attempts) > 0:
+        penultimate_iteration = max(self.cfg.max_steps - 2, 0)
+        final_iteration = max(self.cfg.max_steps - 1, 0)
+
+        # Advisory Logic: Correction Required on the penultimate retry.
+        if iteration == penultimate_iteration and self.can_retry and len(self.failed_attempts) > 0:
             force_critique = (
                 f"{self.critique}\n\n[SYSTEM ADVISORY]: Your previous synthesis failed verification. "
                 "DEEP CORRECTION REQUIRED. Analyze the critique and existing tool results specifically to resolve conflicts."
             )
         
-        # Advisory Logic: Last Chance (Step 11 or final iteration)
-        elif iteration >= self.cfg.max_steps:
+        # Advisory Logic: Last Chance on the configured final iteration.
+        elif iteration >= final_iteration:
             force_critique = (
-                f"{self.critique}\n\n[SYSTEM ADVISORY]: You have reached the absolute step limit. "
+                f"{self.critique}\n\n[SYSTEM ADVISORY]: You have reached the configured step limit. "
                 "Synthesize your FINAL answer NOW. This is your last chance to provide a grounded response."
             )
 
@@ -527,7 +537,8 @@ class _AgentRun:
         self.tool_results.append(tool_result)
 
         if self.cfg.enable_memory:
-            self.memory.add(
+            await self._run_memory_io(
+                self.memory.add,
                 _tool_memory_text(decision.tool, decision.tool_args or {}, result),
                 kind="working",
                 salience=(
@@ -644,8 +655,9 @@ class _AgentRun:
         """Pure business-logic side of verification: update scores and state."""
         self.score = float(verification["score"])
         
-        # Best-Answer Floor: Ensure we always have a baseline, even on a 0.0 score.
-        if not self.best_answer or self.score > self.best_score:
+        if self.score > self.best_score or (
+            self.best_answer is None and self.score > 0.0
+        ):
             self.best_answer = self.answer
             self.best_score = self.score
 
@@ -739,7 +751,6 @@ class _AgentRun:
                 pack.grounding_context,
             )
         self.total_latency += t.ms
-        self.reflection_baseline = self.score
         self.reflection_count += 1
 
         self.traces.log(
@@ -780,7 +791,7 @@ class _AgentRun:
     # ------------------------------------------------------------------
     # Phase: promotion
     # ------------------------------------------------------------------
-    def _promote_if_trustworthy(self, status: str = "ok") -> None:
+    async def _promote_if_trustworthy(self, status: str = "ok") -> None:
         if not self.cfg.enable_memory or not self.answer.strip():
             return
 
@@ -792,7 +803,8 @@ class _AgentRun:
         if status == "timeout_synthesis" and self.score < self.cfg.eval_pass_threshold:
             return
 
-        self.memory.add(
+        await self._run_memory_io(
+            self.memory.add,
             f"Candidate answer: {self.answer}",
             kind="working",
             salience=FINAL_CANDIDATE_SALIENCE,
@@ -833,7 +845,8 @@ class _AgentRun:
             promotion_mode = "confidence_fallback"
 
         if is_trustworthy:
-            self.memory.promote_verified_fact(
+            await self._run_memory_io(
+                self.memory.promote_verified_fact,
                 user_input=self.user_input,
                 answer=self.answer,
                 run_id=self.run_id,
@@ -847,7 +860,8 @@ class _AgentRun:
                     "confidence_fallback": not self.cfg.enable_llm_judge
                 },
             )
-            self.memory.record_experience(
+            await self._run_memory_io(
+                self.memory.record_experience,
                 user_input=self.user_input,
                 plan=[p.goal for p in self.prior_decisions if getattr(p, "goal", None)],
                 tool_calls=[t["tool"] for t in self.tool_results],
@@ -856,7 +870,8 @@ class _AgentRun:
                 verifier_score=self.score,
             )
         elif self.score < self.cfg.eval_pass_threshold:
-            self.memory.record_failure(
+            await self._run_memory_io(
+                self.memory.record_failure,
                 user_input=self.user_input,
                 plan=[p.goal for p in self.prior_decisions if getattr(p, "goal", None)],
                 tool_calls=[t["tool"] for t in self.tool_results],

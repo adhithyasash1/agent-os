@@ -14,10 +14,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from ..config import settings
 from ..llm.embeddings import EmbeddingClient, generate_content_hash, normalize_vector
@@ -42,6 +42,9 @@ DEFAULT_TTLS = {
     "style": None,
     "failure": 60 * 60 * 24 * 30, # Failures decay after a month
 }
+MAX_KIND_FILTERS = len(MEMORY_KINDS)
+RETRIEVAL_CACHE_TTL_SECONDS = 60 * 60 * 24 * 7
+RETRIEVAL_CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
 
 
 SCHEMA = """
@@ -113,7 +116,7 @@ class MemoryStore:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._fts_available = False
-        self._local = threading.local()
+        self._last_cache_cleanup = 0.0
         self.embed_client = EmbeddingClient(
             base_url=settings.ollama_base_url,
             model=settings.embedding_model,
@@ -121,14 +124,20 @@ class MemoryStore:
         ) if settings.enable_embeddings else None
         self._init_schema()
 
-    def _conn(self) -> sqlite3.Connection:
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            c = sqlite3.connect(self.db_path)
-            c.row_factory = sqlite3.Row
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("PRAGMA synchronous=NORMAL")
-            self._local.conn = c
-        return self._local.conn
+    @contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def purge(self, kind: str | None = None) -> None:
         """Purge memory entries. If kind is None, wipes EVERYTHING."""
@@ -175,10 +184,8 @@ class MemoryStore:
             return count
 
     def close(self) -> None:
-        """Explicitly close the persistent connection."""
-        if hasattr(self._local, "conn") and self._local.conn is not None:
-            self._local.conn.close()
-            self._local.conn = None
+        """Compatibility no-op: connections are scoped per operation."""
+        return None
 
     def _init_schema(self) -> None:
         with self._conn() as c:
@@ -242,10 +249,13 @@ class MemoryStore:
                     END
                     """
                 )
-                c.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
                 self._fts_available = True
+                if self._fts_needs_rebuild(c):
+                    c.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
             except sqlite3.OperationalError:
                 self._fts_available = False
+
+        self._prune_retrieval_cache(force=True)
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
         cols = {
@@ -254,6 +264,30 @@ class MemoryStore:
         }
         if column not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    def _fts_needs_rebuild(self, conn: sqlite3.Connection) -> bool:
+        try:
+            memory_count = int(
+                conn.execute("SELECT COUNT(*) AS n FROM memory_entries").fetchone()["n"]
+            )
+            fts_count = int(
+                conn.execute("SELECT COUNT(*) AS n FROM memory_fts").fetchone()["n"]
+            )
+        except sqlite3.OperationalError:
+            return True
+        return memory_count != fts_count
+
+    def _prune_retrieval_cache(self, *, force: bool = False) -> int:
+        now = time.time()
+        if not force and now - self._last_cache_cleanup < RETRIEVAL_CACHE_CLEANUP_INTERVAL_SECONDS:
+            return 0
+
+        cutoff = now - RETRIEVAL_CACHE_TTL_SECONDS
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM retrieval_cache WHERE created_at < ?", (cutoff,))
+            removed = cur.rowcount if cur.rowcount is not None else 0
+        self._last_cache_cleanup = now
+        return removed
 
     def _table_exists(self, conn: sqlite3.Connection, table: str) -> bool:
         row = conn.execute(
@@ -613,7 +647,8 @@ class MemoryStore:
         if not query:
             return []
 
-        normalized_kinds = tuple(_normalize_kind(kind) for kind in (kinds or MEMORY_KINDS))
+        self._prune_retrieval_cache()
+        normalized_kinds = _normalize_kinds(kinds, default_all=True)
         limit = max(k * 5, 12)
         
         mode = settings.retrieval_mode
@@ -905,7 +940,7 @@ class MemoryStore:
             return c.execute(sql, params).fetchall()
 
     def count(self, kinds: Iterable[str] | None = None) -> int:
-        normalized_kinds = tuple(_normalize_kind(kind) for kind in kinds) if kinds else ()
+        normalized_kinds = _normalize_kinds(kinds)
         with self._conn() as c:
             if normalized_kinds:
                 row = c.execute(
@@ -934,7 +969,7 @@ class MemoryStore:
         return {"count": total, "by_kind": by_kind, "expiring_within_1h": expiring_soon}
 
     def clear(self, kinds: Iterable[str] | None = None) -> None:
-        normalized_kinds = tuple(_normalize_kind(kind) for kind in kinds) if kinds else ()
+        normalized_kinds = _normalize_kinds(kinds)
         with self._conn() as c:
             if normalized_kinds:
                 c.execute(
@@ -954,6 +989,31 @@ def _normalize_kind(kind: str) -> str:
     if value not in MEMORY_KINDS:
         raise ValueError(f"unknown memory kind: {kind}")
     return value
+
+
+def _normalize_kinds(
+    kinds: Iterable[str] | None,
+    *,
+    default_all: bool = False,
+) -> tuple[str, ...]:
+    if kinds is None:
+        return MEMORY_KINDS if default_all else ()
+
+    raw_kinds = tuple(kinds)
+    if len(raw_kinds) > MAX_KIND_FILTERS:
+        raise ValueError(
+            f"too many memory kinds requested: {len(raw_kinds)} (max {MAX_KIND_FILTERS})"
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for kind in raw_kinds:
+        value = _normalize_kind(kind)
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return tuple(normalized)
 
 
 def _clamp_salience(value: float) -> float:

@@ -51,6 +51,25 @@ def test_memory_search(client):
     assert "results" in r.json()
 
 
+def test_memory_search_rejects_unknown_kind_with_400(client):
+    r = client.post("/api/v1/memory/search", json={"query": "Paris", "k": 3, "kinds": ["bogus"]})
+    assert r.status_code == 400
+    assert "unknown memory kind" in r.json()["detail"]
+
+
+def test_memory_search_rejects_excessive_kind_filters(client):
+    r = client.post(
+        "/api/v1/memory/search",
+        json={
+            "query": "Paris",
+            "k": 3,
+            "kinds": ["working", "episodic", "semantic", "experience", "style", "failure", "working"],
+        },
+    )
+    assert r.status_code == 400
+    assert "too many memory kinds requested" in r.json()["detail"]
+
+
 def test_memory_stats_have_by_kind(client):
     client.post("/api/v1/runs", json={"input": "What is the capital of France?"})
     r = client.get("/api/v1/memory/stats")

@@ -1,3 +1,4 @@
+from agentos.tools.modules import workspace
 from agentos.tools.registry import build_default_registry
 
 
@@ -52,3 +53,13 @@ async def test_default_registry_respects_flags(tools, settings):
     settings.force_local_only = False
     reg = build_default_registry(settings)
     assert "http_fetch" in reg.names()
+
+
+async def test_workspace_read_file_rejects_oversized_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(workspace, "WORKSPACE_DIR", tmp_path)
+    big_file = tmp_path / "huge.txt"
+    big_file.write_text("x" * (workspace.MAX_READ_BYTES + 1), encoding="utf-8")
+
+    result = await workspace._read_file({"path": "huge.txt"}, {})
+    assert result["status"] == "error"
+    assert "File too large" in result["error"]
