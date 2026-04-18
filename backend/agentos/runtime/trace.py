@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 SCHEMA = """
@@ -141,6 +141,18 @@ def _dumps(v: Any) -> str | None:
 
 
 _initialized_dbs: set[str] = set()
+SENSITIVE_FIELD_MARKERS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "auth",
+    "token",
+    "secret",
+    "password",
+    "cookie",
+    "session",
+    "bearer",
+)
 
 
 class TraceStore:
@@ -148,7 +160,6 @@ class TraceStore:
         self.db_path = db_path
         self.config = config
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._local = threading.local()
         
         global _initialized_dbs
         if db_path not in _initialized_dbs:
@@ -161,20 +172,24 @@ class TraceStore:
             
         self._otel = _OTelBridge(config)
 
-    def _conn(self) -> sqlite3.Connection:
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            c = sqlite3.connect(self.db_path)
-            c.row_factory = sqlite3.Row
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("PRAGMA synchronous=NORMAL")
-            self._local.conn = c
-        return self._local.conn
+    @contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def close(self) -> None:
-        """Explicitly close the persistent connection."""
-        if hasattr(self._local, "conn") and self._local.conn is not None:
-            self._local.conn.close()
-            self._local.conn = None
+        """Compatibility no-op: connections are scoped per operation."""
+        return None
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
         cols = {
@@ -284,7 +299,8 @@ class TraceStore:
                 
                 print(f"  {BOLD}Action:{RESET} {action_type}")
                 if "tool" in item.action:
-                    print(f"    {BOLD}Tool:{RESET} {item.action['tool']}({item.action.get('tool_args', {})})")
+                    tool_args = _format_console_payload(item.action.get("tool_args", {}))
+                    print(f"    {BOLD}Tool:{RESET} {item.action['tool']}({tool_args})")
             
             if item.observation:
                 obs_summary = item.observation.get("summary", item.observation.get("observation_summary", ""))
@@ -541,3 +557,25 @@ def _otel_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
         else:
             out[key] = json.dumps(value, default=str)[:4000]
     return out
+
+
+def _format_console_payload(value: Any) -> str:
+    redacted = _redact_sensitive(value)
+    try:
+        text = json.dumps(redacted, default=str)
+    except Exception:
+        text = str(redacted)
+    return text[:400]
+
+
+def _redact_sensitive(value: Any, key_hint: str | None = None) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _redact_sensitive(item, str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(item, key_hint) for item in value]
+    if key_hint and any(marker in key_hint.lower() for marker in SENSITIVE_FIELD_MARKERS):
+        return "***"
+    return value

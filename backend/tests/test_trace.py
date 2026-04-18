@@ -1,4 +1,4 @@
-from agentos.runtime.trace import RunTransition, TraceEvent, TraceStore
+from agentos.runtime.trace import RunTransition, TraceEvent, TraceStore, _format_console_payload
 
 
 def test_start_and_finish_run(traces):
@@ -55,3 +55,16 @@ def test_rl_transitions_are_returned_with_run(traces):
     assert len(run["transitions"]) == 1
     assert run["transitions"][0]["stage"] == "plan"
     assert run["transitions"][0]["attributes"]["context_ids"] == ["memory:1"]
+
+
+def test_console_payload_redacts_sensitive_tool_args():
+    rendered = _format_console_payload(
+        {
+            "url": "https://example.com",
+            "api_key": "secret-value",
+            "headers": {"Authorization": "Bearer secret-token"},
+        }
+    )
+    assert "secret-value" not in rendered
+    assert "secret-token" not in rendered
+    assert '"api_key": "***"' in rendered

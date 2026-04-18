@@ -153,7 +153,7 @@ def pack_context(
                 meta={
                     "status": item.get("status"), 
                     "tool": item.get("tool"),
-                    "raw_output": item.get("output") # Preserve for smart truncation
+                    "raw_output": _prepare_truncation_input(item.get("output")),
                 },
             )
         )
@@ -335,6 +335,12 @@ def _intelligent_truncate(data: Any, limit: int) -> str:
     For lists, we use Head-Middle-Tail (HMT) slicing to ensure deterministic
     coverage of the boundaries and a representative sample of the middle.
     """
+    if isinstance(data, dict) and data.get("__prepared_output__"):
+        if data["kind"] == "list":
+            data = data["value"]
+        else:
+            return _truncate(data["value"], limit)
+
     if not isinstance(data, list):
         return _truncate(json.dumps(data) if not isinstance(data, str) else data, limit)
     
@@ -379,6 +385,18 @@ def _hmt_slice(data: list, limit: int) -> str:
         
     combined = head + ["... [SNIP] ..."] + middle + ["... [SNIP] ..."] + tail
     return json.dumps(combined)
+
+
+def _prepare_truncation_input(data: Any) -> Any:
+    if isinstance(data, list):
+        return {"__prepared_output__": True, "kind": "list", "value": data}
+    if isinstance(data, str):
+        return {"__prepared_output__": True, "kind": "text", "value": data}
+    try:
+        rendered = json.dumps(data)
+    except Exception:
+        rendered = str(data)
+    return {"__prepared_output__": True, "kind": "text", "value": rendered}
 
 def _is_research_task(user_input: str) -> bool:
     """Robust regex-based research task classifier."""

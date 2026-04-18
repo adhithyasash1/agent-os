@@ -142,6 +142,13 @@ export const api = {
     });
   },
 
+  dumpContext(runId?: string): Promise<{ status: string; target: string }> {
+    const suffix = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+    return apiFetch<{ status: string; target: string }>(`/debug/dump-context${suffix}`, {
+      method: "POST",
+    });
+  },
+
   async leaveFeedback(run_id: string, feedback: FeedbackRequest): Promise<void> {
     await apiFetch<{ run_id: string; feedback: FeedbackRequest }>(`/runs/${run_id}/feedback`, {
       method: "POST",

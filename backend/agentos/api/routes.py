@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
-from fastapi.concurrency import asynccontextmanager
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 import re
@@ -294,7 +293,7 @@ async def get_trace(run_id: str, c: Components = Depends(get_components)):
 
 @api_router.get("/memory/stats")
 async def memory_stats(c: Components = Depends(get_components)):
-    return c.memory.stats()
+    return await asyncio.to_thread(c.memory.stats)
 
 
 @api_router.post("/memory/search")
@@ -302,14 +301,17 @@ async def memory_search(
     req: MemorySearchRequest,
     c: Components = Depends(get_components),
 ):
-    return {
-        "results": c.memory.search(
+    try:
+        results = await asyncio.to_thread(
+            c.memory.search,
             req.query,
-            k=req.k,
+            req.k,
             kinds=req.kinds,
             min_salience=req.min_salience,
         )
-    }
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"results": results}
 
 
 @api_router.get("/tools")
@@ -411,7 +413,7 @@ def _clone_settings(settings: Settings, overrides: dict[str, Any]) -> Settings:
 async def health(c: Components = Depends(get_components)):
     deps = {"memory": "ok", "traces": "ok"}
     try:
-        _ = c.memory.count()
+        _ = await asyncio.to_thread(c.memory.count)
     except Exception:
         deps["memory"] = "error"
 

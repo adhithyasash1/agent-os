@@ -1,10 +1,10 @@
-import os
 from pathlib import Path
 from ..core import tool
 
 # Ensure sandbox exists
 WORKSPACE_DIR = Path("data/workspace").resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+MAX_READ_BYTES = 1024 * 1024
 
 def _resolve_safe_path(requested_path: str) -> Path | None:
     """Resolve and validate a path to ensure it stays within the workspace sandbox."""
@@ -40,6 +40,11 @@ async def _read_file(args: dict, ctx: dict) -> dict:
         return {"status": "error", "error": f"File not found or access denied: {path_str}"}
         
     try:
+        if target.stat().st_size > MAX_READ_BYTES:
+            return {
+                "status": "error",
+                "error": f"File too large to read safely (max {MAX_READ_BYTES} bytes): {path_str}",
+            }
         content = target.read_text(encoding="utf-8")
         return {"status": "ok", "output": content}
     except Exception as e:
