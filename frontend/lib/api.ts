@@ -45,5 +45,20 @@ export const api = {
         method: "POST",
         body: JSON.stringify(payload)
       }
-    )
+    ),
+  getConfig: () => apiFetch<AgentConfig>("/config"),
+  patchConfig: (payload: Partial<AgentConfig>) =>
+    apiFetch<{ updated: Record<string, any>; current: AgentConfig }>("/config", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  purgeSystem: (kind: "working" | "episodic" | "semantic" | "all") =>
+    apiFetch<{ status: string; purged: string }>("/system/purge", {
+      method: "POST",
+      body: JSON.stringify({ kind })
+    }),
+  dumpContext: (runId?: string) =>
+    apiFetch<{ status: string; target: string }>("/debug/dump-context" + (runId ? `?run_id=${runId}` : ""), {
+      method: "POST"
+    })
 };

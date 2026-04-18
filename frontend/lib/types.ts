@@ -1,12 +1,18 @@
+export type AgentConfig = {
+  profile: string;
+  llm_backend: string;
+  prompt_version: string;
+  force_local_only: boolean;
+  debug_verbose: boolean;
+  context_char_budget: number;
+  max_steps: number;
+  flags: Record<string, boolean>;
+};
+
 export type HealthResponse = {
   status: string;
   dependencies: Record<string, string>;
-  config: {
-    profile: string;
-    llm_backend: string;
-    prompt_version: string;
-    flags: Record<string, boolean>;
-  };
+  config: AgentConfig;
 };
 
 export type MemoryStats = {

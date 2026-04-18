@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     enable_reflection: bool = True
     enable_llm_judge: bool = False  # use LLM-as-judge for live verification
     enable_otel: bool = False
+    force_local_only: bool = False  # Air-Gap Mode: block external tools
+    debug_verbose: bool = True     # Controls the backend trace stream
 
     # Optional integrations
     enable_http_fetch: bool = True
@@ -54,6 +56,13 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
     otel_service_name: str = "agentos-core"
     otel_exporter_otlp_endpoint: str = ""
+    eval_pass_threshold: float = 0.7
+    vram_profile: str = "low"  # low | high
+    refusal_patterns: list[str] = [
+        "i don't know", "i cannot", "i'm unable", "i was unable", "unable to",
+        "i do not have", "i encountered an error", "i don't have enough information",
+        "cannot provide accurate", "please retry"
+    ]
     
     # Semantic Retrieval & Reranking
     enable_embeddings: bool = True
@@ -67,9 +76,9 @@ class Settings(BaseSettings):
     semantic_min_score: float = 0.50
 
     # Agent loop
-    max_steps: int = 4
+    max_steps: int = 25
     eval_pass_threshold: float = 0.6
-    context_char_budget: int = 150000
+    context_char_budget: int = 32000  # Default safe floor (32k chars / ~8k tokens)
     memory_search_k: int = 8
     memory_min_salience: float = 0.15
     working_memory_ttl_seconds: int = 3600
@@ -79,9 +88,9 @@ class Settings(BaseSettings):
     # each section). Remainder goes to retrieved memory. Tuned for the
     # default 8k budget; expose so ablations / different model sizes can
     # shift the balance without editing source.
-    context_developer_ratio: float = 0.18
-    context_scratchpad_ratio: float = 0.16
-    context_tool_ratio: float = 0.28
+    context_developer_ratio: float = 0.15
+    context_scratchpad_ratio: float = 0.15
+    context_tool_ratio: float = 0.40
 
     # API
     api_prefix: str = "/api/v1"
@@ -108,21 +117,41 @@ class Settings(BaseSettings):
                 f"They must sum to less than 1.0 to leave room for retrieved memory."
             )
 
-        if self.profile == "minimal":
+        if self.profile == "beta":
+            self.force_local_only = False
+            self.llm_backend = "ollama"
+            self.debug_verbose = True
+            self.enable_llm_judge = True
+            self.force_local_only = False
+        elif self.profile == "minimal":
             self.llm_backend = "mock"
             self.enable_http_fetch = False
             self.enable_tavily = False
             self.enable_llm_judge = False
+            self.force_local_only = True
         elif self.profile == "full":
             if self.llm_backend == "mock":
                 self.llm_backend = "ollama"
             self.enable_llm_judge = True
+
+        # VRAM-Profile Dynamic Scaling
+        if self.vram_profile == "low":
+            self.context_char_budget = 32000
+        elif self.vram_profile == "high":
+            self.context_char_budget = 128000
 
     def describe(self) -> dict:
         return {
             "profile": self.profile,
             "llm_backend": self.llm_backend,
             "prompt_version": self.prompt_version,
+            "force_local_only": self.force_local_only,
+            "debug_verbose": self.debug_verbose,
+            "context_char_budget": self.context_char_budget,
+            "max_steps": self.max_steps,
+            "eval_pass_threshold": self.eval_pass_threshold,
+            "vram_profile": self.vram_profile,
+            "refusal_patterns": self.refusal_patterns,
             "flags": {
                 "memory": self.enable_memory,
                 "planner": self.enable_planner,

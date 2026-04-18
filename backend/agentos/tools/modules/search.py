@@ -1,9 +1,10 @@
 import httpx
 from ..core import tool
+from ..sanitizer import sanitize_output
 
 @tool(
     name="tavily_search",
-    description="Web search via Tavily API.",
+    description="Web search via Tavily API (automatically sanitized).",
     args_schema={
         "type": "object",
         "properties": {
@@ -11,8 +12,10 @@ from ..core import tool
         },
         "required": ["query"]
     },
-    profiles=["full"]
+    profiles=["full"],
+    requires_internet=True
 )
+@sanitize_output
 async def _tavily_search(args: dict, ctx: dict) -> dict:
     query = (args or {}).get("query", "").strip()
     if not query:

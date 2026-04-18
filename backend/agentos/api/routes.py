@@ -87,6 +87,10 @@ class ConfigPatch(BaseModel):
     enable_reflection: bool | None = None
     enable_llm_judge: bool | None = None
     enable_otel: bool | None = None
+    force_local_only: bool | None = None
+    debug_verbose: bool | None = None
+    context_char_budget: int | None = Field(default=None, ge=1000, le=500000)
+    max_steps: int | None = Field(default=None, ge=1, le=100)
 
 
 class MemorySearchRequest(BaseModel):
@@ -247,6 +251,30 @@ async def patch_config(patch: ConfigPatch, request: Request):
         return {"updated": updates, "current": new_settings.describe()}
 
 
+class PurgeRequest(BaseModel):
+    kind: str | None = Field(default=None, pattern="^(working|episodic|semantic|all)$")
+
+
+@api_router.post("/system/purge")
+async def system_purge(req: PurgeRequest, c: Components = Depends(get_components)):
+    """Wipe memory/traces for a clean demo start."""
+    if req.kind == "all":
+        c.memory.purge()
+        c.traces.clear_history()
+    else:
+        c.memory.purge(kind=req.kind)
+    return {"status": "ok", "purged": req.kind or "everything"}
+
+
+@api_router.post("/debug/dump-context")
+async def dump_context(run_id: str | None = None, c: Components = Depends(get_components)):
+    """Technical debug: Print the last packed context to STDOUT."""
+    # We'd need to fetch the last packed context from traces or state
+    # For now, print a breadcrumb to confirm the signal is received
+    print(f"\033[95m[DEBUG]\033[0m Context dump requested for run {run_id or 'latest'}")
+    return {"status": "ok", "target": "backend_terminal"}
+
+
 def _clone_settings(settings: Settings, overrides: dict[str, Any]) -> Settings:
     """Return a copy of `settings` with `overrides` applied.
 
@@ -259,7 +287,9 @@ def _clone_settings(settings: Settings, overrides: dict[str, Any]) -> Settings:
     """
     data = settings.model_dump()
     data.update(overrides)
-    return Settings(**data)
+    new_settings = Settings(**data)
+    new_settings.apply_profile()
+    return new_settings
 
 
 @api_router.get("/health")

@@ -3,7 +3,11 @@
 import { useEffect, useState, useRef, useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "motion/react";
-import { ArrowUp, Terminal, Workflow, Zap, Activity, Bug } from "lucide-react";
+import { ArrowUp, Terminal, Workflow, Zap, Activity, Bug, Settings, Eraser } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+
+import { useAppStore } from "@/lib/store";
+import { SettingsDialog } from "./settings-dialog";
 
 import { api } from "@/lib/api";
 import { formatScore, scoreTone } from "@/lib/utils";
@@ -83,6 +87,12 @@ export function ChatInterface() {
   const queryClient = useQueryClient();
   const [input, setInput] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const { fetchConfig } = useAppStore();
+
+  useEffect(() => {
+    fetchConfig();
+  }, []);
 
   // Poll for completed/historical runs
   const runsQuery = useQuery({
@@ -97,6 +107,11 @@ export function ChatInterface() {
       setInput("");
       queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
+    onError: (error) => {
+      console.error("Agent Run Error:", error);
+      setInput(""); 
+      queryClient.invalidateQueries({ queryKey: ["runs"] });
+    }
   });
 
   const runs = useMemo(() => {
@@ -119,6 +134,18 @@ export function ChatInterface() {
 
   return (
     <div className="flex h-full w-full flex-col bg-[#0b0f19] text-white relative">
+      <SettingsDialog isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
+
+      {/* Header Controls */}
+      <div className="flex items-center justify-end gap-3 px-6 py-4 border-b border-white/5 bg-white/2 backdrop-blur-xl sticky top-0 z-40">
+        <button 
+          onClick={() => setIsSettingsOpen(true)}
+          className="p-2 hover:bg-white/10 rounded-full text-muted hover:text-white transition-all flex items-center gap-2 text-xs font-medium"
+        >
+          <Settings className="h-4 w-4" /> Config
+        </button>
+      </div>
+
       {/* Main Chat Area */}
       <main className="flex-1 overflow-y-auto px-4 py-8 sm:px-6 lg:px-8">
         <div className="mx-auto max-w-3xl space-y-8 pb-32">
@@ -157,16 +184,45 @@ export function ChatInterface() {
                         <Zap className="h-3 w-3 text-accent" />
                       </div>
                       <span className="text-xs font-medium uppercase tracking-wider text-muted">Agent</span>
-                      {run.score !== undefined && (
+                      {run.status === "timeout_synthesis" && (
+                        <span className="text-[10px] ml-auto font-medium px-2 py-0.5 rounded-full bg-amber-400/10 text-amber-500 border border-amber-400/20">
+                          Step Limit Reached (Partial)
+                        </span>
+                      )}
+                      {run.status === "ok" && run.score !== undefined && run.score !== null && (
                         <span className={`text-[10px] ml-auto font-mono px-2 py-0.5 rounded-full ${run.score >= 0.6 ? 'bg-emerald-400/10 text-emerald-400' : 'bg-red-400/10 text-red-500'}`}>
                           ver {formatScore(run.score)}
                         </span>
                       )}
                     </div>
-                    {run.status === "error" ? (
+                    {run.status === "running" ? (
+                      <div className="flex items-center gap-3 py-2">
+                        <div className="h-4 w-4 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+                        <span className="text-sm text-muted animate-pulse">Running agent loops...</span>
+                      </div>
+                    ) : run.status === "error" ? (
                       <div className="text-red-400 flex items-center gap-2"><Bug className="h-4 w-4"/> {run.error}</div>
                     ) : (
-                      <div className="whitespace-pre-wrap text-gray-200">{run.final_output || "No output provided."}</div>
+                      <div className="text-gray-200">
+                        <ReactMarkdown 
+                          components={{
+                            h1: ({node, ...props}) => <h1 className="text-lg font-bold mb-2 mt-4 text-white" {...props} />,
+                            h2: ({node, ...props}) => <h2 className="text-md font-bold mb-2 mt-3 text-white border-b border-white/10 pb-1" {...props} />,
+                            h3: ({node, ...props}) => <h3 className="text-sm font-bold mb-1 mt-2 text-white" {...props} />,
+                            p: ({node, ...props}) => <p className="mb-3 last:mb-0 leading-relaxed" {...props} />,
+                            ul: ({node, ...props}) => <ul className="list-disc pl-5 mb-3 space-y-1" {...props} />,
+                            ol: ({node, ...props}) => <ol className="list-decimal pl-5 mb-3 space-y-1" {...props} />,
+                            li: ({node, ...props}) => <li className="mb-0.5" {...props} />,
+                            code: ({node, inline, ...props}) => 
+                              inline 
+                                ? <code className="bg-white/10 rounded px-1 py-0.5 text-xs font-mono" {...props} />
+                                : <code className="block bg-black/40 rounded p-3 text-xs font-mono my-2 overflow-x-auto" {...props} />,
+                            strong: ({node, ...props}) => <strong className="font-bold text-accent" {...props} />,
+                          }}
+                        >
+                          {run.final_output || "No output provided."}
+                        </ReactMarkdown>
+                      </div>
                     )}
                     
                     {/* Collapsible Run Debugger */}
@@ -177,7 +233,7 @@ export function ChatInterface() {
           ))}
 
           {/* Optimistic Pending Message */}
-          {createRun.isPending && (
+          {createRun.isPending && !runs.some(r => r.user_input === createRun.variables && r.status === "running") && (
              <div className="space-y-6">
                 <motion.div 
                   initial={{ opacity: 0, y: 10 }}
@@ -208,11 +264,11 @@ export function ChatInterface() {
       </main>
 
       {/* Input Area */}
-      <div className="fixed bottom-0 left-0 w-full bg-gradient-to-t from-[#0b0f19] via-[#0b0f19] to-transparent pt-10 pb-6 px-4">
+      <div className="w-full bg-gradient-to-t from-[#0b0f19] via-[#0b0f19] to-transparent pt-6 pb-6 px-4 shrink-0">
         <div className="mx-auto max-w-3xl relative">
           <form 
             onSubmit={handleSubmit}
-            className="flex w-full items-center gap-2 overflow-hidden rounded-[28px] border border-white/10 bg-[#161d2d]/80 p-2 shadow-2xl backdrop-blur-xl focus-within:border-accent/50 focus-within:ring-2 focus-within:ring-accent/20 transition-all"
+            className="flex w-full items-center gap-2 overflow-hidden rounded-[28px] border border-white/10 bg-[#161d2d] p-2 shadow-2xl focus-within:border-accent/50 focus-within:ring-2 focus-within:ring-accent/20 transition-all"
           >
             <input
               type="text"
@@ -232,7 +288,7 @@ export function ChatInterface() {
               <ArrowUp className="h-5 w-5" />
             </button>
           </form>
-          <div className="mt-3 text-center text-[11px] text-muted relative z-10 font-medium">
+          <div className="mt-3 text-center text-[11px] text-muted font-medium">
              AgentOS can make mistakes. Consider verifying critical information.
           </div>
         </div>

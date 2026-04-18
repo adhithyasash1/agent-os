@@ -16,12 +16,13 @@ class Tool:
     args_schema: dict
     fn: ToolFn
     profiles: list[str] = field(default_factory=lambda: ["full"])
+    requires_internet: bool = False
 
 
 # Global decorator registry
 _REGISTERED_TOOLS: list[Tool] = []
 
-def tool(name: str, description: str, args_schema: dict, profiles: list[str] | None = None):
+def tool(name: str, description: str, args_schema: dict, profiles: list[str] | None = None, requires_internet: bool = False):
     """
     Decorator to register a function as an AgentOS Tool.
     
@@ -53,7 +54,8 @@ def tool(name: str, description: str, args_schema: dict, profiles: list[str] | N
             description=description,
             args_schema=args_schema,
             fn=wrapper,
-            profiles=profiles or ["full"]
+            profiles=profiles or ["full"],
+            requires_internet=requires_internet
         )
         _REGISTERED_TOOLS.append(t)
         return wrapper

@@ -81,11 +81,12 @@ async def plan_next_step(
     context: str,
     tool_results: list[dict],
     critique: str = "",
+    context_budget: int = 4000,
 ) -> PlanDecision:
     tool_list = tools.describe() or "(no tools enabled)"
     prompt = PLANNER_PROMPT.format(
         tool_list=tool_list,
-        context=context[:4000] or "(none)",
+        context=context[:max(400, context_budget)] or "(none)",
         tool_results=_summarize_tool_results(tool_results),
         critique=critique or "(none)",
         user_input=user_input,

@@ -130,18 +130,19 @@ def build_default_registry(settings) -> ToolRegistry:
         except Exception as e:
             print(f"Warning: Failed to load module {module_name}: {e}")
             
-    # 2. Register tools that match current profile
+    # 2. Register tools that match current profile and constraints
     for t in _REGISTERED_TOOLS:
         if settings.profile in t.profiles or "full" in t.profiles:
+            # Note: Air-Gap Mode Check
+            if getattr(settings, "force_local_only", False) and t.requires_internet:
+                continue
+
             # Special toggle switches overriding profiles
             if t.name == "http_fetch" and not settings.enable_http_fetch:
                 continue
             if t.name == "tavily_search" and not (settings.enable_tavily and settings.tavily_api_key):
                 continue
             
-            # Note: MCP Plugins are hot-loaded by mcp_loader.py, but they add to _REGISTERED_TOOLS.
-            # So if `enable_mcp_plugins` is false, we should block any tools from mcp_loader.
-            # But the loader itself handles that internally or we filter here:
             if t.name.endswith("_mcp") and not getattr(settings, "enable_mcp_plugins", False):
                 continue
 

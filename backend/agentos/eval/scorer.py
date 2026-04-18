@@ -23,18 +23,10 @@ import re
 from typing import Any
 
 
-REFUSAL_PHRASES = (
-    "i don't know",
-    "i cannot",
-    "i'm unable",
-    "i was unable",
-    "unable to",
-    "i do not have",
-    "i encountered an error",
-    "i don't have enough information",
-    "cannot provide accurate",
-    "please retry",
-)
+from ..config import settings
+
+def _get_refusals() -> list[str]:
+    return getattr(settings, "refusal_patterns", [])
 
 
 def _norm(s: str) -> str:
@@ -53,7 +45,7 @@ def score_expected(answer: str, expected: dict | None) -> float | None:
 
     if expected.get("expected_refusal") is True:
         hay = _norm(answer)
-        return 1.0 if any(phrase in hay for phrase in REFUSAL_PHRASES) else 0.0
+        return 1.0 if any(phrase in hay for phrase in _get_refusals()) else 0.0
 
     contains = expected.get("expected_contains") or []
     if not contains:
@@ -94,7 +86,7 @@ def score_answer_details(
         }
 
     norm = _norm(answer)
-    refusal_detected = any(p in norm for p in REFUSAL_PHRASES)
+    refusal_detected = any(p in norm for p in _get_refusals())
     if refusal_detected:
         return {
             "score": 0.3,
@@ -193,7 +185,7 @@ async def llm_judge(
         return details
 
     norm = _norm(answer)
-    refusal_detected = any(p in norm for p in REFUSAL_PHRASES)
+    refusal_detected = any(p in norm for p in _get_refusals())
 
     correct = _clamp_unit(parsed.get("correct"))
     grounded = _clamp_unit(parsed.get("grounded"))

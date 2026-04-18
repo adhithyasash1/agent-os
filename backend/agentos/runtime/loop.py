@@ -134,6 +134,10 @@ class _AgentRun:
         self.total_latency = 0
         self.total_tokens = 0
         self.current_pack: PackedContext | None = None
+        
+        # New state for Plan V6 hardening
+        self.failed_attempts: list[dict] = []
+        self.can_retry = True
 
     # ------------------------------------------------------------------
     # Orchestration
@@ -143,29 +147,65 @@ class _AgentRun:
             return self._finalize_rejected()
 
         try:
+            # Safe Lifecycle: Clean up expired scratch/failed memories before start.
+            if self.cfg.enable_memory:
+                self.memory.cleanup_expired()
+                
             self._stash_user_input()
             self._emit_understand()
             self._retrieve()
             self.current_pack = self._pack()
 
-            for iteration in range(self.cfg.max_steps):
+            # The loop runs for max_steps (default 10) + 1 potential Overtime Step (Step 11).
+            max_total = self.cfg.max_steps + 1
+            for iteration in range(max_total):
+                # Ensure termination: Step 11 is always the final chance.
+                if iteration == self.cfg.max_steps:
+                    self.can_retry = False
+
                 self.current_pack = self._pack()
                 decision = await self._plan(iteration)
+                
                 if await self._maybe_run_tool(decision, iteration):
                     continue
+                
+                # Synthesis Phase
                 await self._produce_answer(decision)
                 await self._verify(decision, iteration)
-                if (
-                    self.score >= self.cfg.eval_pass_threshold 
-                    or not self.cfg.enable_reflection
-                    or not self.cfg.enable_llm_judge
-                ):
-                    break
-                await self._reflect()
 
-            self._promote_if_trustworthy()
+                # Exit Condition 1: High quality answer found.
+                if self.score >= self.cfg.eval_pass_threshold:
+                    break
+                
+                # Exit Condition 2: Judge/Reflection disabled or retry exhausted.
+                if not self.cfg.enable_reflection or not self.cfg.enable_llm_judge or not self.can_retry:
+                    break
+
+                # Reflection & Soft Reset
+                await self._reflect()
+                
+                # Negative Signal Injection: save fail & retry.
+                self.failed_attempts.append({
+                    "iteration": iteration + 1,
+                    "answer": self.answer,
+                    "critique": self.critique,
+                    "score": self.score
+                })
+                # Clear for next synthesis pass
+                self.answer = ""
+                self.score = 0.0
+            
+            # Determine if we exited via natural early-exit or by hitting the step limit.
+            # iteration is 0-indexed. max_steps is default 10.
+            # If iteration >= 9, we are at or past the normal limit.
+            reached_limit = iteration >= self.cfg.max_steps - 1
+            status = "timeout_synthesis" if (reached_limit and self.answer != "") else "ok"
+            
+            # Post-Synthesis promotion: save final comparison/insights to Graph.
+            self._promote_if_trustworthy(status=status)
+
             final_pack = self._pack()
-            return self._finalize_ok(final_pack)
+            return self._finalize_ok(final_pack, status=status)
 
         except Exception as exc:
             return self._finalize_error(exc)
@@ -182,10 +222,19 @@ class _AgentRun:
         return self._transition_step
 
     def _pack(self) -> PackedContext:
+        # Prune and deduplicate tool results to keep context clean
+        # Rule: Only keep the most recent result for a specific tool call signature
+        unique_results = {}
+        for res in self.tool_results:
+            key = (res.get("tool"), str(res.get("tool_args")))
+            unique_results[key] = res
+            
+        deduped = list(unique_results.values())
+        
         return pack_context(
             user_input=self.user_input,
             memory_hits=self.memory_hits,
-            tool_results=self.tool_results,
+            tool_results=deduped,
             critique=self.critique,
             prior_decisions=self.prior_decisions,
             budget_chars=self.cfg.context_char_budget,
@@ -193,6 +242,7 @@ class _AgentRun:
             developer_ratio=self.cfg.context_developer_ratio,
             scratchpad_ratio=self.cfg.context_scratchpad_ratio,
             tool_ratio=self.cfg.context_tool_ratio,
+            failed_attempts=self.failed_attempts,
         )
 
     def _current_state(self, iteration: int) -> dict[str, Any]:
@@ -327,6 +377,23 @@ class _AgentRun:
         if not self.cfg.enable_planner:
             return _direct_answer()
 
+        # Phase: Conditional Advisories (Plan V6)
+        force_critique = self.critique
+        
+        # Advisory Logic: Correction Required (Step 10, if retrying)
+        if iteration == 9 and self.can_retry and len(self.failed_attempts) > 0:
+            force_critique = (
+                f"{self.critique}\n\n[SYSTEM ADVISORY]: Your previous synthesis failed verification. "
+                "DEEP CORRECTION REQUIRED. Analyze the critique and existing tool results specifically to resolve conflicts."
+            )
+        
+        # Advisory Logic: Last Chance (Step 11 or final iteration)
+        elif iteration >= self.cfg.max_steps:
+            force_critique = (
+                f"{self.critique}\n\n[SYSTEM ADVISORY]: You have reached the absolute step limit. "
+                "Synthesize your FINAL answer NOW. This is your last chance to provide a grounded response."
+            )
+
         with Timer() as t:
             decision = await plan_next_step(
                 self.llm,
@@ -334,7 +401,8 @@ class _AgentRun:
                 self.user_input,
                 self.current_pack.rendered,
                 self.tool_results,
-                self.critique,
+                force_critique,
+                context_budget=self.cfg.context_char_budget,
             )
         self.total_latency += t.ms
         self.prior_decisions.append(decision)
@@ -390,11 +458,19 @@ class _AgentRun:
             return False
 
         with Timer() as t:
-            result = await self.tools.call(
-                decision.tool, 
-                decision.tool_args or {},
-                context={"memory": self.memory, "config": self.cfg}
-            )
+            try:
+                result = await self.tools.call(
+                    decision.tool, 
+                    decision.tool_args or {},
+                    context={"memory": self.memory, "config": self.cfg}
+                )
+            except Exception as e:
+                # Standardized Error Schema: Matches successful output structure for Planner reliability.
+                result = {
+                    "status": "error",
+                    "output": f"RUNTIME_ERROR: {str(e)}",
+                    "observation_summary": "The tool execution failed due to a backend exception."
+                }
         self.total_latency += t.ms
 
         tool_result = {
@@ -619,8 +695,16 @@ class _AgentRun:
     # ------------------------------------------------------------------
     # Phase: promotion
     # ------------------------------------------------------------------
-    def _promote_if_trustworthy(self) -> None:
-        if not self.cfg.enable_memory:
+    def _promote_if_trustworthy(self, status: str = "ok") -> None:
+        if not self.cfg.enable_memory or not self.answer.strip():
+            return
+
+        # 1. Outermost Refusal Guard: Absolute block for any detected refusal.
+        if self.verification.get("refusal_detected"):
+            return
+            
+        # 1b. Timeout Synthesis Guard (Plan V6): Never promote if synthesized under duress and sub-threshold.
+        if status == "timeout_synthesis" and self.score < self.cfg.eval_pass_threshold:
             return
 
         self.memory.add(
@@ -634,11 +718,33 @@ class _AgentRun:
             meta={"stage": "final_candidate"},
         )
 
-        if (
-            self.score >= self.cfg.eval_pass_threshold
-            and self.answer.strip()
-            and self.verification.get("trustworthy")
-        ):
+        # 2. Determine Trustworthiness (Judge Path vs Confidence Fallback Path)
+        is_trustworthy = False
+        promotion_mode = "none"
+        
+        if self.cfg.enable_llm_judge:
+            # Judge Path: Explicitly verified by the verifier LLM.
+            is_trustworthy = (
+                self.score >= self.cfg.eval_pass_threshold
+                and self.verification.get("trustworthy", False)
+            )
+            promotion_mode = "llm_judge"
+        else:
+            # Confidence Path (Fallback): For offline/minimal modes.
+            # We derive 'grounded_confidence' by penalizing tool-less answers.
+            reported_conf = self.initial_score_value if self.initial_score_value is not None else 0.5
+            multiplier = 1.1 if len(self.tool_results) > 0 else 0.7
+            effective_conf = min(reported_conf * multiplier, 1.0)
+            
+            # Require both confidence and a minimal grounding floor (8% unique keyword overlap).
+            overlap = self.verification.get("grounding_overlap", 0.0)
+            is_trustworthy = (
+                effective_conf >= self.cfg.eval_pass_threshold 
+                and overlap >= 0.08
+            )
+            promotion_mode = "confidence_fallback"
+
+        if is_trustworthy:
             self.memory.promote_verified_fact(
                 user_input=self.user_input,
                 answer=self.answer,
@@ -647,6 +753,11 @@ class _AgentRun:
                 verifier_score=self.score,
                 salience=max(PROMOTED_FACT_SALIENCE_FLOOR, self.score),
                 episodic_ttl_seconds=self.cfg.episodic_memory_ttl_seconds,
+                meta={
+                    "stage": "promoted",
+                    "promotion_mode": promotion_mode,
+                    "confidence_fallback": not self.cfg.enable_llm_judge
+                },
             )
             self.memory.record_experience(
                 user_input=self.user_input,
@@ -669,7 +780,7 @@ class _AgentRun:
     # ------------------------------------------------------------------
     # Phase: finalize (ok / error)
     # ------------------------------------------------------------------
-    def _finalize_ok(self, final_pack: PackedContext) -> AgentResult:
+    def _finalize_ok(self, final_pack: PackedContext, status: str = "ok") -> AgentResult:
         self.traces.log(
             TraceEvent(
                 self.run_id,
@@ -694,7 +805,7 @@ class _AgentRun:
                 observation={"answer": self.answer[:400], "score": self.score},
                 score=self.score,
                 done=True,
-                status="ok",
+                status=status,
                 attributes={"prompt_version": self.cfg.prompt_version},
             )
         )
@@ -704,13 +815,14 @@ class _AgentRun:
             self.score,
             self.total_latency,
             self.total_tokens,
-            status="ok",
+            status=status,
         )
         return AgentResult(
             run_id=self.run_id,
             answer=self.answer,
             score=self.score,
             steps=self._step,
+            status=status,
             tool_calls=self.tool_results,
             total_latency_ms=self.total_latency,
             total_tokens=self.total_tokens,

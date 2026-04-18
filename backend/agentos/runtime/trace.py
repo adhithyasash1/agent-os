@@ -231,6 +231,7 @@ class TraceStore:
                 event.to_row(),
             )
         self._otel.log_event(event)
+        self._console_stream("event", event)
 
     def log_transition(self, transition: RunTransition) -> None:
         with self._conn() as c:
@@ -241,6 +242,59 @@ class TraceStore:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 transition.to_row(),
             )
+        self._console_stream("transition", transition)
+
+    def _console_stream(self, kind: str, item: Any) -> None:
+        """Stream colored summaries to the terminal for live debugging."""
+        # ANSI Escape Codes
+        BLUE = "\033[94m"
+        CYAN = "\033[96m"
+        GREEN = "\033[92m"
+        YELLOW = "\033[93m"
+        RED = "\033[91m"
+        BOLD = "\033[1m"
+        RESET = "\033[0m"
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        prefix = f"{RESET}[{ts}] {BOLD}"
+
+        if self.config and not getattr(self.config, "debug_verbose", True):
+            return
+
+        if kind == "event":
+            color = BLUE if item.kind == "understand" else YELLOW
+            print(f"{prefix}{color}{item.kind.upper()}{RESET} | step {item.step} | {item.name or ''}")
+            if item.error:
+                print(f"  {RED}Error: {item.error}{RESET}")
+        
+        elif kind == "transition":
+            color = CYAN if item.stage == "plan" else GREEN
+            status = f" ({item.status})" if item.status else ""
+            print(f"{prefix}{color}{item.stage.upper()}{RESET} | step {item.step}{status}")
+            
+            if item.action:
+                action_type = item.action.get("action", item.action.get("type"))
+                goal = item.action.get("goal")
+                rationale = item.action.get("rationale")
+                
+                if goal:
+                    print(f"  {BOLD}Goal:{RESET} {goal}")
+                if rationale:
+                    print(f"  {BOLD}Rationale:{RESET} {rationale}")
+                
+                print(f"  {BOLD}Action:{RESET} {action_type}")
+                if "tool" in item.action:
+                    print(f"    {BOLD}Tool:{RESET} {item.action['tool']}({item.action.get('tool_args', {})})")
+            
+            if item.observation:
+                obs_summary = item.observation.get("summary", item.observation.get("observation_summary", ""))
+                if obs_summary:
+                    print(f"  {BOLD}Observation:{RESET} {obs_summary}")
+                elif "error" in item.observation:
+                    print(f"  {RED}Observation Error:{RESET} {item.observation['error']}{RESET}")
+            
+            if item.done:
+                print(f"  {BOLD}{GREEN}COMPLETED{RESET}")
 
     def record_feedback(self, run_id: str, feedback: dict[str, Any]) -> None:
         with self._conn() as c:
@@ -249,6 +303,14 @@ class TraceStore:
                 (json.dumps(feedback), run_id),
             )
         self._otel.annotate_run(run_id, {"user_feedback": feedback})
+
+    def clear_history(self) -> None:
+        """Wipe all run history and trace logs for a clean demo slate."""
+        with self._conn() as c:
+            c.execute("DELETE FROM run_transitions")
+            c.execute("DELETE FROM trace_events")
+            c.execute("DELETE FROM runs")
+            c.execute("VACUUM")
 
     def list_runs(self, limit: int = 50) -> list[dict]:
         with self._conn() as c:

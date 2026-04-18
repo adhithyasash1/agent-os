@@ -27,6 +27,7 @@ class OllamaLLM:
         max_retries: int = 2,
         retry_delay: float = 1.5,
         api_key: str | None = None,
+        num_ctx: int = 4096,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -34,6 +35,7 @@ class OllamaLLM:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.api_key = api_key or None
+        self.num_ctx = num_ctx
 
     def _headers(self) -> dict[str, str]:
         if self.api_key:
@@ -50,7 +52,10 @@ class OllamaLLM:
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0},
+            "options": {
+                "temperature": 0,
+                "num_ctx": self.num_ctx
+            },
         }
         last_err: Exception | None = None
         for attempt in range(self.max_retries + 1):

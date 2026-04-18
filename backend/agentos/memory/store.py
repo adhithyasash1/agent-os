@@ -84,6 +84,27 @@ CREATE TABLE IF NOT EXISTS system_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS entities (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    entity_type TEXT,
+    description TEXT,
+    meta TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS relations (
+    subject_id TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    meta TEXT,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (subject_id, predicate, object_id),
+    FOREIGN KEY (subject_id) REFERENCES entities(id),
+    FOREIGN KEY (object_id) REFERENCES entities(id)
+);
 """
 
 
@@ -108,6 +129,38 @@ class MemoryStore:
             c.execute("PRAGMA synchronous=NORMAL")
             self._local.conn = c
         return self._local.conn
+
+    def purge(self, kind: str | None = None) -> None:
+        """Purge memory entries. If kind is None, wipes EVERYTHING."""
+        with self._conn() as c:
+            if kind:
+                c.execute("DELETE FROM memory_entries WHERE kind=?", (kind,))
+                if kind == "semantic":
+                    c.execute("DELETE FROM entities")
+                    c.execute("DELETE FROM relations")
+            else:
+                c.execute("DELETE FROM memory_entries")
+                c.execute("DELETE FROM entities")
+                c.execute("DELETE FROM relations")
+                c.execute("DELETE FROM retrieval_cache")
+                c.execute("DELETE FROM embeddings")
+            c.execute("VACUUM")
+
+    def cleanup_expired(self) -> int:
+        """Prune expired memory entries based on their TTL.
+        Returns the number of rows deleted.
+        """
+        now = time.time()
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM memory_entries WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
+            count = cur.rowcount
+            if count > 0:
+                # If we deleted rows, the FTS index needs a refresh
+                if self._fts_available:
+                    c.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
+                # Increment version to invalidate retrieval caches
+                c.execute("UPDATE system_state SET value = CAST(value AS INTEGER) + 1 WHERE key = 'memory_version'")
+            return count
 
     def close(self) -> None:
         """Explicitly close the persistent connection."""
@@ -326,6 +379,62 @@ class MemoryStore:
             # Increment DB Memory Version
             c.execute("UPDATE system_state SET value = CAST(value AS INTEGER) + 1 WHERE key = 'memory_version'")
             return int(cur.lastrowid)
+
+    def upsert_entity(self, name: str, entity_type: str | None = None, description: str | None = None, meta: dict | None = None) -> str:
+        """Upsert a knowledge graph entity."""
+        import uuid
+        now = time.time()
+        # Find existing by name/type or generate ID
+        entity_id = hashlib.sha256(f"{name.lower()}:{entity_type.lower() if entity_type else ''}".encode()).hexdigest()[:16]
+        
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT INTO entities (id, name, entity_type, description, meta, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    description = COALESCE(?, description),
+                    meta = ?,
+                    updated_at = ?
+                """,
+                (entity_id, name, entity_type, description, json.dumps(meta or {}), now, now, description, json.dumps(meta or {}), now)
+            )
+            return entity_id
+
+    def add_relation(self, subject_id: str, predicate: str, object_id: str, meta: dict | None = None) -> None:
+        """Link two entities in the knowledge graph."""
+        now = time.time()
+        with self._conn() as c:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO relations (subject_id, predicate, object_id, meta, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (subject_id, predicate.lower(), object_id, json.dumps(meta or {}), now)
+            )
+
+    def graph_search(self, entity_id: str) -> dict:
+        """Retrieve the neighborhood of an entity."""
+        with self._conn() as c:
+            entity = c.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)).fetchone()
+            if not entity:
+                return {}
+                
+            out_rel = c.execute(
+                "SELECT r.predicate, e.name, e.id FROM relations r JOIN entities e ON r.object_id = e.id WHERE r.subject_id = ?",
+                (entity_id,)
+            ).fetchall()
+            
+            in_rel = c.execute(
+                "SELECT r.predicate, e.name, e.id FROM relations r JOIN entities e ON r.subject_id = e.id WHERE r.object_id = ?",
+                (entity_id,)
+            ).fetchall()
+            
+            return {
+                "entity": dict(entity),
+                "outbound": [dict(r) for r in out_rel],
+                "inbound": [dict(r) for r in in_rel]
+            }
 
     def promote_verified_fact(
         self,
