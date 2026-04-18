@@ -155,6 +155,7 @@ async def llm_judge(
     user_input: str,
     answer: str,
     context: str,
+    max_context_chars: int = 15000,
 ) -> dict:
     """Ask the LLM to rate correctness + grounding. Returns a details dict.
 
@@ -167,7 +168,7 @@ async def llm_judge(
 
     prompt = _JUDGE_PROMPT.format(
         user_input=user_input[:2000],
-        context=(context or "(empty)")[:3000],
+        context=(context or "(empty)")[:max_context_chars],
         answer=answer[:2000],
     )
     try:
@@ -175,6 +176,9 @@ async def llm_judge(
     except Exception as exc:
         details = score_answer_details(user_input, answer, context)
         details["judge_error"] = str(exc)[:200]
+        # Treat judge failure as potential miscalibration if ground truth overlap is high
+        if details.get("grounding_overlap", 0) > 0.1:
+            details["verifier_miscalibration"] = True
         return details
 
     parsed = _parse_judge_json(raw)
@@ -182,6 +186,8 @@ async def llm_judge(
         details = score_answer_details(user_input, answer, context)
         details["judge_error"] = "unparseable judge response"
         details["judge_raw"] = (raw or "")[:240]
+        if details.get("grounding_overlap", 0) > 0.1:
+            details["verifier_miscalibration"] = True
         return details
 
     norm = _norm(answer)
@@ -190,14 +196,26 @@ async def llm_judge(
     correct = _clamp_unit(parsed.get("correct"))
     grounded = _clamp_unit(parsed.get("grounded"))
     score = round(0.7 * correct + 0.3 * grounded, 4)
+    
+    # Miscalibration Guard: Detect if the judge is 'blind' to factual grounding.
+    # If the LLM says it's flat out wrong but the mathematical overlap is high,
+    # the judge is likely hallucinating hallucinations.
+    overlap_info = score_answer_details(user_input, answer, context)
+    grounding_overlap = overlap_info.get("grounding_overlap", 0.0)
+    
+    miscalibration = False
+    if correct < 0.2 and grounding_overlap > 0.1:
+        miscalibration = True
+
     return {
         "score": score,
         "mode": "llm-judge",
         "judge_correct": correct,
         "judge_grounded": grounded,
         "judge_reason": str(parsed.get("reason", ""))[:300],
-        "grounding_overlap": 0.0,
+        "grounding_overlap": grounding_overlap,
         "refusal_detected": refusal_detected,
+        "verifier_miscalibration": miscalibration,
         # Only trust the judge when both sub-scores agree the answer is
         # at least passable. Otherwise don't promote. Block if it's a known refusal.
         "trustworthy": (correct >= 0.7 and grounded >= 0.5) and not refusal_detected,

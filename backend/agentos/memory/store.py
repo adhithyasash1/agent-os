@@ -144,15 +144,27 @@ class MemoryStore:
                 c.execute("DELETE FROM relations")
                 c.execute("DELETE FROM retrieval_cache")
                 c.execute("DELETE FROM embeddings")
-            c.execute("VACUUM")
 
-    def cleanup_expired(self) -> int:
+        # VACUUM must be run outside of a transaction.
+        tmp_conn = sqlite3.connect(self.db_path)
+        try:
+            tmp_conn.execute("VACUUM")
+        finally:
+            tmp_conn.close()
+
+    def cleanup_expired(self, exclude_run_id: str | None = None) -> int:
         """Prune expired memory entries based on their TTL.
         Returns the number of rows deleted.
         """
         now = time.time()
+        sql = "DELETE FROM memory_entries WHERE expires_at IS NOT NULL AND expires_at < ?"
+        params = [now]
+        if exclude_run_id:
+            sql += " AND (source_run_id IS NULL OR source_run_id != ?)"
+            params.append(exclude_run_id)
+
         with self._conn() as c:
-            cur = c.execute("DELETE FROM memory_entries WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
+            cur = c.execute(sql, params)
             count = cur.rowcount
             if count > 0:
                 # If we deleted rows, the FTS index needs a refresh

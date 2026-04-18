@@ -107,7 +107,7 @@ class _AgentRun:
         self.tools = tools
         self.memory = memory
         self.traces = traces
-        self.cfg = cfg
+        self.cfg = cfg.model_copy(deep=True)
         self.expected = expected
 
         self.run_id = traces.start_run(
@@ -135,6 +135,10 @@ class _AgentRun:
         self.total_tokens = 0
         self.current_pack: PackedContext | None = None
         
+        # Best Answer Tracking (Plan V7)
+        self.best_answer = ""
+        self.best_score = 0.0
+        
         # New state for Plan V6 hardening
         self.failed_attempts: list[dict] = []
         self.can_retry = True
@@ -143,6 +147,9 @@ class _AgentRun:
     # Orchestration
     # ------------------------------------------------------------------
     async def run(self) -> AgentResult:
+        # Start of run: Clean up expired memory but exclude THIS run's potentially fresh data
+        self.memory.cleanup_expired(exclude_run_id=self.run_id)
+
         if not self.user_input or not self.user_input.strip():
             return self._finalize_rejected()
 
@@ -184,6 +191,18 @@ class _AgentRun:
                 # Reflection & Soft Reset
                 await self._reflect()
                 
+                # Double-Dip Trajectory Check: Noise-resilient termination on quality death spirals.
+                if len(self.failed_attempts) >= 2:
+                    curr_score = self.score
+                    prev_score = self.failed_attempts[-1]["score"]
+                    prev_prev_score = self.failed_attempts[-2]["score"]
+                    if curr_score < prev_score < prev_prev_score:
+                        self.can_retry = False # Quality is degrading consistently
+
+                # Miscalibration Valve: Abort if the judge is 'blind' to grounding.
+                if self.verification.get("verifier_miscalibration"):
+                    self.can_retry = False
+
                 # Negative Signal Injection: save fail & retry.
                 self.failed_attempts.append({
                     "iteration": iteration + 1,
@@ -201,6 +220,12 @@ class _AgentRun:
             reached_limit = iteration >= self.cfg.max_steps - 1
             status = "timeout_synthesis" if (reached_limit and self.answer != "") else "ok"
             
+            # Finalization: Return the best-scoring answer found across all attempts.
+            # This prevents serving a degraded retry (e.g. 0.7 -> 0.4 abort).
+            if self.best_answer:
+                self.answer = self.best_answer
+                self.score = self.best_score
+
             # Post-Synthesis promotion: save final comparison/insights to Graph.
             self._promote_if_trustworthy(status=status)
 
@@ -555,10 +580,15 @@ class _AgentRun:
     # ------------------------------------------------------------------
     async def _verify(self, decision: PlanDecision, iteration: int) -> None:
         pack = self.current_pack
+        
+        # High-Fidelity Grounding: Compute overlap against the UNTRUNCATED context.
+        # This ensures the miscalibration valve can 'see' facts that the 30k judge-cap missed.
+        full_grounding = self._get_high_fidelity_grounding()
+        
         verification = score_answer_details(
             self.user_input,
             self.answer,
-            pack.grounding_context,
+            full_grounding,
             expected=self.expected,
         )
         # Kick the LLM judge in for live (no-ground-truth) runs when the
@@ -568,12 +598,26 @@ class _AgentRun:
             and self.cfg.enable_llm_judge
             and self.expected is None
         ):
+            # Dynamic Verifier Context: ensure parity with planner's hardware-scaled window.
+            # Safety cap of 30k to prevent judge context-window overflow.
+            v_cap = int(min(self.cfg.context_char_budget * 0.5, 30000))
+            
             verification = await llm_judge(
                 self.llm,
                 self.user_input,
                 self.answer,
-                pack.grounding_context,
+                context=pack.grounding_context, # Judge still uses truncated context
+                max_context_chars=v_cap,
             )
+            # Re-verify grounding overlap against full context for the judge's miscalibration check
+            verification["grounding_overlap"] = score_answer_details(
+                self.user_input, self.answer, full_grounding
+            )["grounding_overlap"]
+            
+            # Re-calculate miscalibration with the full-fidelity overlap
+            if verification.get("judge_correct", 0) < 0.2 and verification["grounding_overlap"] > 0.1:
+                verification["verifier_miscalibration"] = True
+
         self._apply_verification(decision, verification, iteration)
         self._log_verification(decision, verification, iteration)
 
@@ -582,6 +626,12 @@ class _AgentRun:
     ) -> None:
         """Pure business-logic side of verification: update scores and state."""
         self.score = float(verification["score"])
+        
+        # Best-Answer Floor: Ensure we always have a baseline, even on a 0.0 score.
+        if not self.best_answer or self.score > self.best_score:
+            self.best_answer = self.answer
+            self.best_score = self.score
+
         if self.initial_score_value is None:
             self.initial_score_value = self.score
 
@@ -596,6 +646,19 @@ class _AgentRun:
         verification["verifier_disagreement"] = verifier_disagreement
         verification["reflection_delta"] = reflection_delta
         self.verification = verification
+
+    def _get_high_fidelity_grounding(self) -> str:
+        """Render all available evidence without truncation (capped at 100k).
+        Used purely for the heuristic grounding overlap check.
+        """
+        parts = []
+        for h in self.memory_hits:
+            parts.append(h.get("text", ""))
+        for r in self.tool_results:
+            parts.append(str(r.get("output", "")))
+        
+        full = "\n\n".join(parts)
+        return full[:100000] # Safe CPU ceiling
 
     def _log_verification(
         self, decision: PlanDecision, verification: dict[str, Any], iteration: int,
@@ -612,10 +675,15 @@ class _AgentRun:
                 output=verification,
                 attributes={
                     "prompt_version": self.cfg.prompt_version,
-                    "context_ids": pack.included_ids,
-                    "verifier_score": self.score,
-                    "reflection_delta": verification.get("reflection_delta"),
+                    "mode": verification["mode"],
+                    "judge_correct": verification.get("judge_correct"),
+                    "judge_grounded": verification.get("judge_grounded"),
+                    "judge_reason": verification.get("judge_reason"),
+                    "verifier_miscalibration": verification.get("verifier_miscalibration"),
+                    "grounding_overlap": verification.get("grounding_overlap"),
                     "verifier_disagreement": verification.get("verifier_disagreement", False),
+                    "reflection_delta": verification.get("reflection_delta"),
+                    "retry_count": len(self.failed_attempts),
                 },
             )
         )

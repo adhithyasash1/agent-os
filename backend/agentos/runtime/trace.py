@@ -310,7 +310,13 @@ class TraceStore:
             c.execute("DELETE FROM run_transitions")
             c.execute("DELETE FROM trace_events")
             c.execute("DELETE FROM runs")
-            c.execute("VACUUM")
+
+        # VACUUM must be run outside of a transaction.
+        tmp_conn = sqlite3.connect(self.db_path)
+        try:
+            tmp_conn.execute("VACUUM")
+        finally:
+            tmp_conn.close()
 
     def list_runs(self, limit: int = 50) -> list[dict]:
         with self._conn() as c:
